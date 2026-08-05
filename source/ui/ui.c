@@ -1953,27 +1953,160 @@ static bool environment_callback(unsigned cmd, void *data) {
 		default: return false;
 	}
 }
+// sharp-scale for GB/GBC only: the frame is scaled in software to the final
+// aspect-fit size (266x240) and the layer window is set equal to the buffer
+// so the hardware scaler never resamples (its bilinear filter blurred the
+// pixel art). The scale is nearest-neighbor except at source-pixel
+// boundaries, where a blend window ~half a destination pixel wide smooths
+// the uneven column widths and scroll shimmer that pure nearest-neighbor
+// shows at non-integer ratios. Interior pixels are untouched (weight 0 =
+// pure NN). Weights are per-axis constants for a given resolution so they
+// are precomputed once per layer size. GBA stays on the stock hardware
+// path, CPU scaling at 240x160 costs more than it can spare.
+#define SHARP_WINDOW 2.0f // transition = (1/SHARP_WINDOW) dst pixels wide
+
+static int scaled_w = 0; // on-screen size of the game frame
+static int scaled_h = 0;
+
+static int      sharp_sx[SCREEN_WIDTH];
+static uint32_t sharp_wx[SCREEN_WIDTH]; // 0..256
+static int      sharp_sy[SCREEN_HEIGHT];
+static uint32_t sharp_wy[SCREEN_HEIGHT];
+
+static void sharp_init_axis(int* smap, uint32_t* wmap, int src_len, int dst_len) {
+	float scale = (float)dst_len / src_len;
+	for (int i=0; i<dst_len; i++) {
+		float pos = (i + 0.5f) / scale - 0.5f;
+		if (pos < 0) pos = 0;
+		int s = (int)pos;
+		float frac = pos - s;
+		float f = (frac - 0.5f) * scale * SHARP_WINDOW + 0.5f;
+		if (f < 0) f = 0;
+		if (f > 1) f = 1;
+		if (s >= src_len-1) { s = src_len-1; f = 0; }
+		smap[i] = s;
+		wmap[i] = (uint32_t)(f * 256.0f + 0.5f);
+	}
+}
+
+static inline uint32_t rgb565_to_argb(uint16_t c) {
+	return 0xFF000000
+		| ((c & 0xF800) << 8) | ((c & 0xE000) << 3)
+		| ((c & 0x07E0) << 5) | ((c & 0x0600) >> 1)
+		| ((c & 0x001F) << 3) | ((c & 0x001C) >> 2);
+}
+static inline uint32_t argb_blend(uint32_t a, uint32_t b, uint32_t w) { // w 0..256
+	uint32_t iw = 256 - w;
+	uint32_t rb = (((a & 0xFF00FF) * iw + (b & 0xFF00FF) * w) >> 8) & 0xFF00FF;
+	uint32_t g  = (((a & 0x00FF00) * iw + (b & 0x00FF00) * w) >> 8) & 0x00FF00;
+	return 0xFF000000 | rb | g;
+}
+static void sharp_scale_row(uint32_t* dst, const uint16_t* src, int dst_len) {
+	int last_s = -1;
+	uint32_t last_c = 0;
+	for (int x=0; x<dst_len; x++) {
+		int s = sharp_sx[x];
+		uint32_t w = sharp_wx[x];
+		uint32_t c;
+		if (!w) {
+			if (s==last_s) { dst[x] = last_c; continue; }
+			c = rgb565_to_argb(src[s]);
+			last_s = s;
+			last_c = c;
+		}
+		else {
+			c = argb_blend(rgb565_to_argb(src[s]), rgb565_to_argb(src[s+1]), w);
+		}
+		dst[x] = c;
+	}
+}
+
 static void video_refresh_callback(const void *data, unsigned width, unsigned height, size_t pitch) {
 	if (!data) return;
-	
+
 	static uint32_t last_ms = 0;
 	if (fastforward && !ELAPSED_SINCE(16, last_ms)) return;
-	
+
 	if (framebuffer && (framebuffer->w!=width || framebuffer->h!=height || framebuffer->pitch!=pitch)) {
 		SDL_FreeSurface(framebuffer);
 		framebuffer = NULL;
 	}
-	
+
+	int sharp = (width==160 && height==144); // GB/GBC only
+
 	if (!framebuffer) {
 		framebuffer = SDL_CreateRGBSurfaceFrom(NULL, width, height, 16, pitch, RGB565_MASKS);
-		reinit_layer(width, height);
+
+		if (sharp) {
+			// aspect-fit size, rounded to even for the display engine; the
+			// height lands exactly on the screen dimension so reinit_layer's
+			// scale is 1.0 and the hardware passes the buffer through 1:1
+			float scale_x = (float)SCREEN_WIDTH / width;
+			float scale_y = (float)SCREEN_HEIGHT / height;
+			float fit = scale_x < scale_y ? scale_x : scale_y;
+			scaled_w = (int)(width * fit + 0.5f) & ~1;
+			scaled_h = (int)(height * fit + 0.5f) & ~1;
+			if (scaled_w > SCREEN_WIDTH) scaled_w = SCREEN_WIDTH;
+			if (scaled_h > SCREEN_HEIGHT) scaled_h = SCREEN_HEIGHT;
+
+			sharp_init_axis(sharp_sx, sharp_wx, width, scaled_w);
+			sharp_init_axis(sharp_sy, sharp_wy, height, scaled_h);
+		}
+		else {
+			scaled_w = width;
+			scaled_h = height;
+		}
 	}
-	
+
+	// menu previews and game switching can leave the layer at another size;
+	// the blit below is only valid when the layer matches the scaled frame
+	if (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h) reinit_layer(scaled_w, scaled_h);
+
 	framebuffer->pixels = (void*)data;
-	SDL_BlitSurface(framebuffer, &(SDL_Rect){0,0,width,height}, scaler, &(SDL_Rect){(SCALER_WIDTH-width)/2,(SCALER_HEIGHT-height)/2});
-	
+	if (!sharp) {
+		SDL_BlitSurface(framebuffer, &(SDL_Rect){0,0,width,height}, scaler, &(SDL_Rect){(SCALER_WIDTH-width)/2,(SCALER_HEIGHT-height)/2});
+	}
+	else {
+		// two cached horizontally-scaled rows; vertical blend only on the
+		// few boundary rows (weight != 0), everything else is a row copy
+		static uint32_t row_buf[2][SCREEN_WIDTH];
+		int buf_sy[2] = {-1,-1};
+		int dst_pitch = scaler->pitch / 4;
+		int src_pitch = pitch / 2;
+		uint32_t* dst = (uint32_t*)scaler->pixels;
+		const uint16_t* src = (const uint16_t*)data;
+		for (int y=0; y<scaled_h; y++) {
+			int sy = sharp_sy[y];
+			uint32_t wy = sharp_wy[y];
+			int i0 = -1, i1 = -1;
+			for (int i=0; i<2; i++) {
+				if (buf_sy[i]==sy) i0 = i;
+				if (buf_sy[i]==sy+1) i1 = i;
+			}
+			if (i0<0) {
+				i0 = (i1==0) ? 1 : 0;
+				sharp_scale_row(row_buf[i0], src + sy*src_pitch, scaled_w);
+				buf_sy[i0] = sy;
+			}
+			uint32_t* d = dst + y*dst_pitch;
+			if (!wy) {
+				memcpy(d, row_buf[i0], scaled_w*4);
+			}
+			else {
+				if (i1<0) {
+					i1 = 1 - i0;
+					sharp_scale_row(row_buf[i1], src + (sy+1)*src_pitch, scaled_w);
+					buf_sy[i1] = sy+1;
+				}
+				uint32_t* r0 = row_buf[i0];
+				uint32_t* r1 = row_buf[i1];
+				for (int x=0; x<scaled_w; x++) d[x] = argb_blend(r0[x], r1[x], wy);
+			}
+		}
+	}
+
 	dirty_scaler();
-	
+
 	last_ms = SDL_GetTicks();
 }
 static void audio_sample_callback(int16_t left, int16_t right) {
@@ -3621,9 +3754,11 @@ static void App_menu(void) {
 	if (ui.osd==OSD_NONE) disable_overlay();
 	invalidate_overlay = 1;
 
-	if (!app.quit && !app.reload && (SCALER_WIDTH!=framebuffer->w || SCALER_HEIGHT!=framebuffer->h)) {
+	// restore the layer to the on-screen frame size (equals the core's
+	// native size except for GB/GBC, which is software-scaled to 266x240)
+	if (!app.quit && !app.reload && scaled_w && (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h)) {
 		present_layers(VSYNC_WAIT);
-		reinit_layer(framebuffer->w, framebuffer->h);
+		reinit_layer(scaled_w, scaled_h);
 	}
 
 	Pad_reset();
