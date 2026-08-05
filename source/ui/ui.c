@@ -183,6 +183,18 @@ static int PWR_isConnected(void) {
 #define CPU_SPEED_DEFAULT	0x02d01d22 // 720MHz
 #define CPU_SPEED_MAX		0x03601a32 // 864MHz (unstable)
 
+// overclock steps selectable from the menu, session-only (a freeze just
+// needs a power cycle, the device always boots at the stock 720MHz).
+// PLL = 24MHz * N * K / M with N/K/M = field+1, same register CPU_setSpeed
+// pokes. 792 and above froze on hardware (eggs' old 864 constant is
+// marked unstable too), so the ladder stops at 768.
+static const struct { uint16_t mhz; uint32_t raw; } cpu_speeds[] = {
+	{ 720, CPU_SPEED_DEFAULT },
+	{ 744, 0x02e81e22 }, // N=31 K=3 M=3
+	{ 768, 0x03001f22 }, // N=32 K=3 M=3
+};
+static int cpu_speed_index = 0;
+
 static void CPU_setSpeed(uint32_t mhz) {
 	volatile uint32_t* mem;
 	volatile uint8_t memdev = 0;
@@ -2693,6 +2705,7 @@ typedef enum {
 	ITEM_LOAD,
 	ITEM_ARCHIVE,
 	ITEM_RESET,
+	ITEM_CPU,
 } MenuItem;
 typedef enum {
 	PREVIEW_CURRENT,
@@ -2705,6 +2718,7 @@ static MenuItem current_items[] = {
 	ITEM_LOAD,
 	ITEM_ARCHIVE,
 	ITEM_RESET,
+	ITEM_CPU,
 };
 static MenuItem other_items[] = {
 	ITEM_LOAD,
@@ -2727,6 +2741,11 @@ static const char *Menu_getItemName(MenuItem item) {
 		case ITEM_LOAD:		return "LOAD";
 		case ITEM_ARCHIVE:	return "ARCHIVE";
 		case ITEM_RESET:	return "RESET";
+		case ITEM_CPU: {
+			static char name[24];
+			sprintf(name, "CPU %uMHZ", cpu_speeds[cpu_speed_index].mhz);
+			return name;
+		}
 	}
 	return NULL;
 }
@@ -2799,7 +2818,7 @@ static void Device_sleep(void) {
 		}
 	}
 
-	CPU_setSpeed(CPU_SPEED_DEFAULT);
+	CPU_setSpeed(cpu_speeds[cpu_speed_index].raw); // restore the selected speed on wake
 	Settings_setVolume(settings.volume);
 	Settings_setBrightness(settings.brightness);
 	enable_layers();
@@ -3673,7 +3692,12 @@ static void App_menu(void) {
 					else if (item==ITEM_RESET) {
 						Core_reset();
 					}
-					if (item!=ITEM_ARCHIVE) Menu_quit();
+					else if (item==ITEM_CPU) {
+						cpu_speed_index = (cpu_speed_index + 1) % (int)NUMBER_OF(cpu_speeds);
+						CPU_setSpeed(cpu_speeds[cpu_speed_index].raw);
+						menu.dirty = 1;
+					}
+					if (item!=ITEM_ARCHIVE && item!=ITEM_CPU) Menu_quit();
 				}
 				else {
 					if (item==ITEM_LOAD) {
