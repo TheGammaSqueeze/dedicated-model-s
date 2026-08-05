@@ -1966,7 +1966,7 @@ static bool environment_callback(unsigned cmd, void *data) {
 // path, CPU scaling at 240x160 costs more than it can spare.
 // transition = (1/sharp_window) dst pixels wide; adjustable in game with
 // MENU+A (+0.1, sharper) and MENU+Y (-0.1, softer), not persisted
-#define SHARP_WINDOW_DEFAULT	2.0f
+#define SHARP_WINDOW_DEFAULT	2.2f
 #define SHARP_WINDOW_MIN		1.0f
 #define SHARP_WINDOW_MAX		8.0f
 static float sharp_window = SHARP_WINDOW_DEFAULT;
@@ -2032,28 +2032,37 @@ static inline uint32_t argb_blend(uint32_t a, uint32_t b, uint32_t w) { // w 0..
 	uint32_t g  = (((a & 0x00FF00) * iw + (b & 0x00FF00) * w) >> 8) & 0x00FF00;
 	return 0xFF000000 | rb | g;
 }
-#define AVG565(a,b) ((uint16_t)((((a)&(b)) + ((((a)^(b))>>1) & 0x7BEF))))
+#define AVG32(a,b) (((a)&(b)) + ((((a)^(b))>>1) & 0x7F7F7F7F))
+
+// the ARM926 has no branch predictor, so the row scaler runs three
+// branchless passes instead of per-pixel tests: convert the source row
+// once, gather through a precomputed index map, then patch the few
+// boundary pixels from a sparse blend list
+static uint8_t  sharp_gather[SCREEN_WIDTH];
+static struct { uint16_t x; uint8_t s; uint8_t q; } sharp_hblend[SCREEN_WIDTH];
+static int sharp_hblend_n = 0;
+static int sharp_src_w = 0;
+static uint32_t sharp_row_temp[256];
+
 static void sharp_scale_row(uint32_t* dst, const uint16_t* src, int dst_len) {
-	int last_s = -1;
-	uint32_t last_c = 0;
-	for (int x=0; x<dst_len; x++) {
-		int s = sharp_sx[x];
-		uint32_t w = sharp_wx[x];
-		uint32_t c;
-		if (!w) {
-			if (s==last_s) { dst[x] = last_c; continue; }
-			c = rgb565_to_argb(src[s]);
-			last_s = s;
-			last_c = c;
-		}
-		else {
-			// w is quantized to quarters: blend the two taps in 565 with
-			// shift-averages (no multiplies), convert once
-			uint16_t a = src[s], b = src[s+1];
-			uint16_t m = AVG565(a,b);
-			c = rgb565_to_argb(w==2 ? m : w==1 ? AVG565(a,m) : AVG565(b,m));
-		}
-		dst[x] = c;
+	uint32_t* t = sharp_row_temp;
+	for (int s=0; s<sharp_src_w; s+=4) {
+		t[s]   = rgb565_to_argb(src[s]);
+		t[s+1] = rgb565_to_argb(src[s+1]);
+		t[s+2] = rgb565_to_argb(src[s+2]);
+		t[s+3] = rgb565_to_argb(src[s+3]);
+	}
+	const uint8_t* g = sharp_gather;
+	for (int x=0; x<dst_len; x+=2) {
+		dst[x]   = t[g[x]];
+		dst[x+1] = t[g[x+1]];
+	}
+	for (int i=0; i<sharp_hblend_n; i++) {
+		uint32_t a = t[sharp_hblend[i].s];
+		uint32_t b = t[sharp_hblend[i].s+1];
+		uint32_t q = sharp_hblend[i].q;
+		uint32_t m = AVG32(a,b);
+		dst[sharp_hblend[i].x] = q==2 ? m : q==1 ? AVG32(a,m) : AVG32(b,m);
 	}
 }
 
@@ -2102,6 +2111,20 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 			sharp_init_axis(sharp_sx, sharp_wx, width, scaled_w);
 			sharp_init_axis(sharp_sy, sharp_wy, height, scaled_h);
+
+			// bake the horizontal maps into the branchless gather map and
+			// sparse blend list used by sharp_scale_row
+			sharp_src_w = width;
+			sharp_hblend_n = 0;
+			for (int x=0; x<scaled_w; x++) {
+				sharp_gather[x] = (uint8_t)sharp_sx[x];
+				if (sharp_wx[x]) {
+					sharp_hblend[sharp_hblend_n].x = (uint16_t)x;
+					sharp_hblend[sharp_hblend_n].s = (uint8_t)sharp_sx[x];
+					sharp_hblend[sharp_hblend_n].q = (uint8_t)sharp_wx[x];
+					sharp_hblend_n++;
+				}
+			}
 		}
 		else if (display_mode==DISPMODE_2X) {
 			// 2x pixel doubling, center-cropped where it overscans
@@ -2212,7 +2235,6 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 				uint32_t* r1 = row_ptr[i1];
 				// wy is quantized to quarters: blend with shift-averages,
 				// no multiplies, and pick the variant once per row
-				#define AVG32(a,b) (((a)&(b)) + ((((a)^(b))>>1) & 0x7F7F7F7F))
 				if (wy==2) {
 					for (int x=0; x<scaled_w; x+=2) {
 						d[x]   = AVG32(r0[x],   r1[x]);
@@ -2235,7 +2257,6 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 						d[x+1] = AVG32(r1[x+1], m1);
 					}
 				}
-				#undef AVG32
 			}
 		}
 	}
