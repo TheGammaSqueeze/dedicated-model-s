@@ -349,6 +349,7 @@ static void Settings_setBrightness(int value) {
 
 static int	SCALER_WIDTH	= SCREEN_WIDTH; // (240)
 static int	SCALER_HEIGHT	= SCREEN_HEIGHT; // (180)
+static int	SCALER_BPP		= 32; // see reinit_layer
 
 #define	SCALER_X 	((SCREEN_WIDTH - SCALER_WIDTH)/2)
 #define	SCALER_Y 	((SCREEN_HEIGHT - SCALER_HEIGHT)/2)
@@ -364,6 +365,7 @@ static int	SCALER_HEIGHT	= SCREEN_HEIGHT; // (180)
 #define DEBE_SIZE		(0x1000)
 #define	LAY1_ADDR_REG_L	(0x854)
 #define	LAY1_ADDR_REG_H	(0x861)
+#define	LAY1_ADDR_REG_L	(0x854)
 #define	LAY2_ADDR_REG_L	(0x858)
 #define	LAY2_ADDR_REG_H	(0x862)
 #define	DEBE_ADDR(addr)	(((uint32_t)(addr) - 0x80000000) << 3)
@@ -593,7 +595,8 @@ static void present_layers(int vsync) {
 	
 	if (sc_dirty) {
 		sc_info.fb.addr[0] = (uintptr_t)sc_meminfo.padd + sc_flip_offset;
-		defe_map[BUF_ADDR0_REG/4] = sc_info.fb.addr[0];
+		if (SCALER_BPP==16) debe_map[LAY1_ADDR_REG_L/4] = DEBE_ADDR(sc_info.fb.addr[0]);
+		else                defe_map[BUF_ADDR0_REG/4] = sc_info.fb.addr[0];
 		sc_flip_offset ^= scaler->pitch*scaler->h;
 		scaler->pixels = (void*)((uintptr_t)sc_meminfo.vadd + sc_flip_offset);
 		sc_dirty = 0;
@@ -804,25 +807,49 @@ static int scale_mode = SCALE_ASPECT;
 static inline int round_to_nearest(int value, int n) {
     return (value + n / 2) / n * n;
 }
-static void reinit_layer(int w, int h) {
-	if (w!=SCALER_WIDTH || h!=SCALER_HEIGHT) {
+// 32 = scaler work mode, ARGB, DEFE fetch, hardware scaling available.
+// 16 = normal work mode, RGB565, DEBE fetch, shown 1:1 (the DEFE cannot
+// fetch 565, but the DEBE back-end can; sharp mode outputs at final size
+// so it needs no hardware scaling).
+static void reinit_layer(int w, int h, int bpp) {
+	int mode_changed = (bpp != SCALER_BPP);
+	if (w!=SCALER_WIDTH || h!=SCALER_HEIGHT || mode_changed) {
 		memset(sc_meminfo.vadd, 0, sc_meminfo.size);
 		ion_flush(sc_meminfo.vadd, sc_meminfo.size);
 	}
-	
+
 	SCALER_WIDTH = w;
 	SCALER_HEIGHT = h;
+	SCALER_BPP = bpp;
 	SDL_FreeSurface(scaler);
-	scaler = SDL_CreateRGBSurfaceFrom(sc_meminfo.vadd + SCALER_WIDTH*SCALER_HEIGHT*4, SCALER_WIDTH, SCALER_HEIGHT, 32, SCALER_WIDTH*4, ARGB8888_MASKS);
-	
+	if (bpp==16)
+		scaler = SDL_CreateRGBSurfaceFrom(sc_meminfo.vadd + SCALER_WIDTH*SCALER_HEIGHT*2, SCALER_WIDTH, SCALER_HEIGHT, 16, SCALER_WIDTH*2, RGB565_MASKS);
+	else
+		scaler = SDL_CreateRGBSurfaceFrom(sc_meminfo.vadd + SCALER_WIDTH*SCALER_HEIGHT*4, SCALER_WIDTH, SCALER_HEIGHT, 32, SCALER_WIDTH*4, ARGB8888_MASKS);
+
 	uint32_t args[4] = {0, LAYER1, (uintptr_t)&sc_info, 0};
+	if (bpp==16) {
+		sc_info.mode = DISP_LAYER_WORK_MODE_NORMAL;
+		sc_info.fb.format = DISP_FORMAT_RGB_565;
+		sc_info.alpha_mode = 1;					// global alpha (565 has none)
+		sc_info.alpha_value = 255;
+	}
+	else {
+		sc_info.mode = DISP_LAYER_WORK_MODE_SCALER;
+		sc_info.fb.format = DISP_FORMAT_ARGB_8888;
+		sc_info.alpha_mode = 0;
+		sc_info.alpha_value = 0;
+	}
 	sc_info.fb.size.width = SCALER_WIDTH;		// framebuffer.w
 	sc_info.fb.size.height = SCALER_HEIGHT;		// framebuffer.h
 	sc_info.fb.src_win.x = 0;					// source crop.x
 	sc_info.fb.src_win.y = 0;					// source crop.y
 	sc_info.fb.src_win.width = SCALER_WIDTH;	// source crop.w
 	sc_info.fb.src_win.height = SCALER_HEIGHT;	// source crop.h
+	// work mode and format only latch on layer enable
+	if (mode_changed) disable_scaler();
 	if (ioctl(disp_fd, DISP_CMD_LAYER_SET_INFO, &args)<0) fprintf(stderr, "LAYER_SET_INFO failed %s\n",strerror(errno));
+	if (mode_changed) enable_scaler();
 
 	sc_flip_offset = scaler->pitch*scaler->h;
 	
@@ -1570,7 +1597,7 @@ static void UI_init(void) {
 	enable_layers();
 	disable_overlay();
 	
-	reinit_layer(SCREEN_WIDTH, SCREEN_HEIGHT); // TODO: remove
+	reinit_layer(SCREEN_WIDTH, SCREEN_HEIGHT, 32); // TODO: remove
 	
 	ui.icons = IMG_Load(ASSETS_PATH "/icons.png");
 	Fonts_init(); // TODO: can this be deferred to extras?
@@ -2032,37 +2059,30 @@ static inline uint32_t argb_blend(uint32_t a, uint32_t b, uint32_t w) { // w 0..
 	uint32_t g  = (((a & 0x00FF00) * iw + (b & 0x00FF00) * w) >> 8) & 0x00FF00;
 	return 0xFF000000 | rb | g;
 }
-#define AVG32(a,b) (((a)&(b)) + ((((a)^(b))>>1) & 0x7F7F7F7F))
+// the sharp layer is native RGB565, so scaling a row is pure data movement:
+// gather source pixels through a precomputed index map (no conversion at
+// all), then patch the few boundary pixels from a sparse blend list. Both
+// are branchless; the ARM926 has no branch predictor. AVG565P averages two
+// packed 565 pixels per 32-bit op for the vertical blends.
+#define AVG565(a,b)  ((uint16_t)((((a)&(b)) + ((((a)^(b))>>1) & 0x7BEF))))
+#define AVG565P(a,b) (((a)&(b)) + ((((a)^(b))>>1) & 0x7BEF7BEF))
 
-// the ARM926 has no branch predictor, so the row scaler runs three
-// branchless passes instead of per-pixel tests: convert the source row
-// once, gather through a precomputed index map, then patch the few
-// boundary pixels from a sparse blend list
 static uint8_t  sharp_gather[SCREEN_WIDTH];
 static struct { uint16_t x; uint8_t s; uint8_t q; } sharp_hblend[SCREEN_WIDTH];
 static int sharp_hblend_n = 0;
-static int sharp_src_w = 0;
-static uint32_t sharp_row_temp[256];
 
-static void sharp_scale_row(uint32_t* dst, const uint16_t* src, int dst_len) {
-	uint32_t* t = sharp_row_temp;
-	for (int s=0; s<sharp_src_w; s+=4) {
-		t[s]   = rgb565_to_argb(src[s]);
-		t[s+1] = rgb565_to_argb(src[s+1]);
-		t[s+2] = rgb565_to_argb(src[s+2]);
-		t[s+3] = rgb565_to_argb(src[s+3]);
-	}
+static void sharp_scale_row(uint16_t* dst, const uint16_t* src, int dst_len) {
 	const uint8_t* g = sharp_gather;
 	for (int x=0; x<dst_len; x+=2) {
-		dst[x]   = t[g[x]];
-		dst[x+1] = t[g[x+1]];
+		dst[x]   = src[g[x]];
+		dst[x+1] = src[g[x+1]];
 	}
 	for (int i=0; i<sharp_hblend_n; i++) {
-		uint32_t a = t[sharp_hblend[i].s];
-		uint32_t b = t[sharp_hblend[i].s+1];
+		uint16_t a = src[sharp_hblend[i].s];
+		uint16_t b = src[sharp_hblend[i].s+1];
 		uint32_t q = sharp_hblend[i].q;
-		uint32_t m = AVG32(a,b);
-		dst[sharp_hblend[i].x] = q==2 ? m : q==1 ? AVG32(a,m) : AVG32(b,m);
+		uint16_t m = AVG565(a,b);
+		dst[sharp_hblend[i].x] = q==2 ? m : q==1 ? AVG565(a,m) : AVG565(b,m);
 	}
 }
 
@@ -2114,7 +2134,6 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 			// bake the horizontal maps into the branchless gather map and
 			// sparse blend list used by sharp_scale_row
-			sharp_src_w = width;
 			sharp_hblend_n = 0;
 			for (int x=0; x<scaled_w; x++) {
 				sharp_gather[x] = (uint8_t)sharp_sx[x];
@@ -2141,7 +2160,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 	// menu previews and game switching can leave the layer at another size;
 	// the blit below is only valid when the layer matches the scaled frame
-	if (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h) reinit_layer(scaled_w, scaled_h);
+	if (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=(sharp?16:32)) reinit_layer(scaled_w, scaled_h, sharp?16:32);
 
 	// the integer modes must be shown 1:1; reinit_layer stretches to fit the
 	// screen, so pin the window back to the buffer size after any reinit
@@ -2190,18 +2209,19 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 		// unique source rows are scaled straight into their first dst row
 		// (no staging memcpy); repeats copy that row, and the few boundary
 		// rows (weight != 0) blend two cached rows. Rows only needed for a
-		// blend are staged in tmp_buf.
-		static uint32_t tmp_buf[2][SCREEN_WIDTH];
-		uint32_t* row_ptr[2];
+		// blend are staged in tmp_buf. Everything stays native 565.
+		static uint16_t tmp_buf[2][SCREEN_WIDTH] __attribute__((aligned(4)));
+		uint16_t* row_ptr[2];
 		int row_sy[2] = {-1,-1};
-		int dst_pitch = scaler->pitch / 4;
+		int dst_pitch = scaler->pitch / 2;
 		int src_pitch = pitch / 2;
-		uint32_t* dst = (uint32_t*)scaler->pixels;
+		uint16_t* dst = (uint16_t*)scaler->pixels;
 		const uint16_t* src = (const uint16_t*)data;
+		int w2 = scaled_w / 2; // packed 32-bit words per row
 		for (int y=0; y<scaled_h; y++) {
 			int sy = sharp_sy[y];
 			uint32_t wy = sharp_wy[y];
-			uint32_t* d = dst + y*dst_pitch;
+			uint16_t* d = dst + y*dst_pitch;
 			int i0 = -1, i1 = -1;
 			for (int i=0; i<2; i++) {
 				if (row_sy[i]==sy) i0 = i;
@@ -2209,7 +2229,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 			}
 			if (!wy) {
 				if (i0>=0) {
-					memcpy(d, row_ptr[i0], scaled_w*4);
+					memcpy(d, row_ptr[i0], scaled_w*2);
 				}
 				else {
 					sharp_scale_row(d, src + sy*src_pitch, scaled_w);
@@ -2231,30 +2251,25 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 					row_sy[i1] = sy+1;
 					row_ptr[i1] = tmp_buf[i1];
 				}
-				uint32_t* r0 = row_ptr[i0];
-				uint32_t* r1 = row_ptr[i1];
-				// wy is quantized to quarters: blend with shift-averages,
-				// no multiplies, and pick the variant once per row
+				// wy is quantized to quarters: blend two packed pixels per
+				// 32-bit shift-average, variant picked once per row (rows
+				// and dst are 4-byte aligned, scaled_w is even)
+				uint32_t* r0 = (uint32_t*)row_ptr[i0];
+				uint32_t* r1 = (uint32_t*)row_ptr[i1];
+				uint32_t* dw = (uint32_t*)d;
 				if (wy==2) {
-					for (int x=0; x<scaled_w; x+=2) {
-						d[x]   = AVG32(r0[x],   r1[x]);
-						d[x+1] = AVG32(r0[x+1], r1[x+1]);
-					}
+					for (int i=0; i<w2; i++) dw[i] = AVG565P(r0[i], r1[i]);
 				}
 				else if (wy==1) {
-					for (int x=0; x<scaled_w; x+=2) {
-						uint32_t m0 = AVG32(r0[x],   r1[x]);
-						uint32_t m1 = AVG32(r0[x+1], r1[x+1]);
-						d[x]   = AVG32(r0[x],   m0);
-						d[x+1] = AVG32(r0[x+1], m1);
+					for (int i=0; i<w2; i++) {
+						uint32_t m = AVG565P(r0[i], r1[i]);
+						dw[i] = AVG565P(r0[i], m);
 					}
 				}
 				else {
-					for (int x=0; x<scaled_w; x+=2) {
-						uint32_t m0 = AVG32(r0[x],   r1[x]);
-						uint32_t m1 = AVG32(r0[x+1], r1[x+1]);
-						d[x]   = AVG32(r1[x],   m0);
-						d[x+1] = AVG32(r1[x+1], m1);
+					for (int i=0; i<w2; i++) {
+						uint32_t m = AVG565P(r0[i], r1[i]);
+						dw[i] = AVG565P(r1[i], m);
 					}
 				}
 			}
@@ -3555,10 +3570,10 @@ static void App_preview(const char *path) {
 	
 	int disabled = 0;
 
-	if (SCALER_WIDTH!=w || SCALER_HEIGHT!=h) {
+	if (SCALER_WIDTH!=w || SCALER_HEIGHT!=h || SCALER_BPP!=32) {
 		disable_scaler();
 		disabled = 1;
-		reinit_layer(w, h);
+		reinit_layer(w, h, 32);
 	}
 
 	SDL_FillRect(scaler, NULL, 0);
@@ -3910,11 +3925,12 @@ static void App_menu(void) {
 	if (ui.osd==OSD_NONE) disable_overlay();
 	invalidate_overlay = 1;
 
-	// restore the layer to the on-screen frame size (equals the core's
-	// native size except for GB/GBC, which is software-scaled to 266x240)
-	if (!app.quit && !app.reload && scaled_w && (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h)) {
+	// restore the layer to the on-screen frame size and mode (sharp GB/GBC
+	// renders 565 into a normal-mode layer, everything else scaler ARGB)
+	int game_bpp = (settings.sharp && display_mode==DISPMODE_FIT && framebuffer && framebuffer->w==160 && framebuffer->h==144) ? 16 : 32;
+	if (!app.quit && !app.reload && scaled_w && (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=game_bpp)) {
 		present_layers(VSYNC_WAIT);
-		reinit_layer(scaled_w, scaled_h);
+		reinit_layer(scaled_w, scaled_h, game_bpp);
 	}
 
 	Pad_reset();
