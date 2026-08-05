@@ -1898,7 +1898,8 @@ static void log_callback(enum retro_log_level level, const char *fmt, ...) {
 }
 static int core_options_dirty = 0;
 static struct retro_audio_buffer_status_callback audio_status = {0};
-static int frame_behind = 0; // set by frame_pacing_update, read by App_render
+static int frame_behind = 0;   // set by frame_pacing_update, read by App_render
+static int frame_rendered = 0; // did the core deliver video this iteration?
 static bool environment_callback(unsigned cmd, void *data) {
 	switch (cmd) {
 		case RETRO_ENVIRONMENT_SET_MESSAGE: {
@@ -2178,6 +2179,8 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	if (display_mode!=DISPMODE_FIT && (sc_info.screen_win.width!=(unsigned)scaled_w || sc_info.screen_win.height!=(unsigned)scaled_h)) {
 		resize_scaler((SCREEN_WIDTH-scaled_w)/2, (SCREEN_HEIGHT-scaled_h)/2, scaled_w, scaled_h);
 	}
+
+	frame_rendered = 1;
 
 	framebuffer->pixels = (void*)data;
 	if (display_mode==DISPMODE_2X) {
@@ -4115,8 +4118,12 @@ static void App_render(void) {
 	}
 
 	// a frame that already ran over its budget skips the vsync wait so it
-	// only pays its real overrun, not a whole extra refresh period
-	present_layers((fastforward || frame_behind) ? VSYNC_NONE : VSYNC_WAIT);
+	// only pays its real overrun, not a whole extra refresh period. A frame
+	// the core skipped (frame dupe) has nothing new to show, so waiting for
+	// vsync would make the skip cost a full period of wall time and defeat
+	// its purpose: present immediately so the skip actually buys catch-up
+	// time (no tearing either, the game layer was not touched).
+	present_layers((fastforward || frame_behind || !frame_rendered) ? VSYNC_NONE : VSYNC_WAIT);
 }
 
 // frame pacing: measure real iteration time against the frame budget and
@@ -4129,6 +4136,8 @@ static void App_render(void) {
 static void frame_pacing_update(void) {
 	static uint32_t prev_ms = 0;
 	static float debt = 0;
+
+	frame_rendered = 0;
 
 	uint32_t now = SDL_GetTicks();
 	uint32_t dt = prev_ms ? now - prev_ms : 0;
@@ -4143,12 +4152,15 @@ static void frame_pacing_update(void) {
 	if (debt < 0) debt = 0;               // running fast pays nothing forward
 	if (debt > budget*3) debt = budget*3; // cap the burst after a long spell
 
-	// space pulses at least two rendered frames apart: games that draw
-	// alternating-frame sprites (pseudo-transparency) get both phases
-	// rendered between skips, so they shimmer instead of vanishing
+	// space pulses at least two rendered frames apart so games that draw
+	// alternating-frame sprites (pseudo-transparency) get both phases on
+	// screen; under a heavy deficit escalate to every other frame. Note
+	// skipping only reclaims rendering time: a scene whose emulation alone
+	// exceeds the budget stays slow no matter how much video is dropped.
 	static int since_skip = 2;
+	int min_gap = debt >= budget*2 ? 1 : 2;
 	int pulse = 0;
-	if (debt >= budget && since_skip >= 2) {
+	if (debt >= budget && since_skip >= min_gap) {
 		pulse = 1;
 		since_skip = 0;
 		debt -= budget;

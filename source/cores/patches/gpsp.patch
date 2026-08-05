@@ -39,3 +39,20 @@ index 625f46e..99f4780 100644
  #else
    #define ROM_TRANSLATION_CACHE_SIZE (1024 * 1024 * 10)
    #define RAM_TRANSLATION_CACHE_SIZE (1024 * 512)
+diff --git a/savestate.c b/savestate.c
+index ee2dfaa..b4a5591 100644
+--- a/savestate.c
++++ b/savestate.c
+@@ -151,6 +151,12 @@ bool gba_load_state(const void* src)
+ 
+   video_reload_counters();
+ 
++  // Recompute all sound-rate-derived steps (PSG channel and timer
++  // frequency steps) from the restored registers: the serialized values
++  // were derived from the sound rate in effect when the state was saved,
++  // which is not necessarily the current one.
++  sound_frequency_changed();
++
+   // Reset most of the frame state and dynarec state
+ #ifdef HAVE_DYNAREC
+   if (dynarec_enable)
