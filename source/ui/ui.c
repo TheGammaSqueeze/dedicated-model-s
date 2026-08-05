@@ -1963,7 +1963,7 @@ static bool environment_callback(unsigned cmd, void *data) {
 // pure NN). Weights are per-axis constants for a given resolution so they
 // are precomputed once per layer size. GBA stays on the stock hardware
 // path, CPU scaling at 240x160 costs more than it can spare.
-#define SHARP_WINDOW 2.5f // transition = (1/SHARP_WINDOW) dst pixels wide
+#define SHARP_WINDOW 2.0f // transition = (1/SHARP_WINDOW) dst pixels wide
 
 static int scaled_w = 0; // on-screen size of the game frame
 static int scaled_h = 0;
@@ -1973,7 +1973,19 @@ static uint32_t sharp_wx[SCREEN_WIDTH]; // 0..256
 static int      sharp_sy[SCREEN_HEIGHT];
 static uint32_t sharp_wy[SCREEN_HEIGHT];
 
+// 565 -> ARGB via three tiny tables (512 bytes, cache-resident); the ARM926
+// pays more for the bitfield shuffle than for three loads
+static uint32_t lut_r[32], lut_g[64], lut_b[32];
+
 static void sharp_init_axis(int* smap, uint32_t* wmap, int src_len, int dst_len) {
+	static int lut_ready = 0;
+	if (!lut_ready) {
+		lut_ready = 1;
+		for (int i=0; i<32; i++) lut_r[i] = 0xFF000000 | (((i<<3)|(i>>2)) << 16);
+		for (int i=0; i<64; i++) lut_g[i] = ((i<<2)|(i>>4)) << 8;
+		for (int i=0; i<32; i++) lut_b[i] = (i<<3)|(i>>2);
+	}
+
 	float scale = (float)dst_len / src_len;
 	for (int i=0; i<dst_len; i++) {
 		float pos = (i + 0.5f) / scale - 0.5f;
@@ -1984,16 +1996,17 @@ static void sharp_init_axis(int* smap, uint32_t* wmap, int src_len, int dst_len)
 		if (f < 0) f = 0;
 		if (f > 1) f = 1;
 		if (s >= src_len-1) { s = src_len-1; f = 0; }
+		uint32_t w = (uint32_t)(f * 256.0f + 0.5f);
+		// snap the band edges: a <10% blend is invisible but costs a blend
+		if (w <= 24) w = 0;
+		else if (w >= 232) { s += 1; w = 0; }
 		smap[i] = s;
-		wmap[i] = (uint32_t)(f * 256.0f + 0.5f);
+		wmap[i] = w;
 	}
 }
 
 static inline uint32_t rgb565_to_argb(uint16_t c) {
-	return 0xFF000000
-		| ((c & 0xF800) << 8) | ((c & 0xE000) << 3)
-		| ((c & 0x07E0) << 5) | ((c & 0x0600) >> 1)
-		| ((c & 0x001F) << 3) | ((c & 0x001C) >> 2);
+	return lut_r[c >> 11] | lut_g[(c >> 5) & 63] | lut_b[c & 31];
 }
 static inline uint32_t argb_blend(uint32_t a, uint32_t b, uint32_t w) { // w 0..256
 	uint32_t iw = 256 - w;
@@ -2058,6 +2071,17 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 			sharp_init_axis(sharp_sx, sharp_wx, width, scaled_w);
 			sharp_init_axis(sharp_sy, sharp_wy, height, scaled_h);
+
+			// quantize vertical weights to quarters so boundary rows can
+			// blend with shift-averages instead of per-pixel multiplies
+			for (int y=0; y<scaled_h; y++) {
+				uint32_t w = sharp_wy[y];
+				if (!w) continue;
+				uint32_t q = (w + 32) >> 6; // 0..4
+				if (q == 0) sharp_wy[y] = 0;
+				else if (q == 4) { sharp_sy[y] += 1; sharp_wy[y] = 0; }
+				else sharp_wy[y] = q; // 1..3 quarters
+			}
 		}
 		else {
 			scaled_w = width;
@@ -2074,10 +2098,13 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 		SDL_BlitSurface(framebuffer, &(SDL_Rect){0,0,width,height}, scaler, &(SDL_Rect){(SCALER_WIDTH-width)/2,(SCALER_HEIGHT-height)/2});
 	}
 	else {
-		// two cached horizontally-scaled rows; vertical blend only on the
-		// few boundary rows (weight != 0), everything else is a row copy
-		static uint32_t row_buf[2][SCREEN_WIDTH];
-		int buf_sy[2] = {-1,-1};
+		// unique source rows are scaled straight into their first dst row
+		// (no staging memcpy); repeats copy that row, and the few boundary
+		// rows (weight != 0) blend two cached rows. Rows only needed for a
+		// blend are staged in tmp_buf.
+		static uint32_t tmp_buf[2][SCREEN_WIDTH];
+		uint32_t* row_ptr[2];
+		int row_sy[2] = {-1,-1};
 		int dst_pitch = scaler->pitch / 4;
 		int src_pitch = pitch / 2;
 		uint32_t* dst = (uint32_t*)scaler->pixels;
@@ -2085,29 +2112,64 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 		for (int y=0; y<scaled_h; y++) {
 			int sy = sharp_sy[y];
 			uint32_t wy = sharp_wy[y];
+			uint32_t* d = dst + y*dst_pitch;
 			int i0 = -1, i1 = -1;
 			for (int i=0; i<2; i++) {
-				if (buf_sy[i]==sy) i0 = i;
-				if (buf_sy[i]==sy+1) i1 = i;
+				if (row_sy[i]==sy) i0 = i;
+				if (row_sy[i]==sy+1) i1 = i;
 			}
-			if (i0<0) {
-				i0 = (i1==0) ? 1 : 0;
-				sharp_scale_row(row_buf[i0], src + sy*src_pitch, scaled_w);
-				buf_sy[i0] = sy;
-			}
-			uint32_t* d = dst + y*dst_pitch;
 			if (!wy) {
-				memcpy(d, row_buf[i0], scaled_w*4);
+				if (i0>=0) {
+					memcpy(d, row_ptr[i0], scaled_w*4);
+				}
+				else {
+					sharp_scale_row(d, src + sy*src_pitch, scaled_w);
+					i0 = (i1==0) ? 1 : 0;
+					row_sy[i0] = sy;
+					row_ptr[i0] = d;
+				}
 			}
 			else {
+				if (i0<0) {
+					i0 = (i1==0) ? 1 : 0;
+					sharp_scale_row(tmp_buf[i0], src + sy*src_pitch, scaled_w);
+					row_sy[i0] = sy;
+					row_ptr[i0] = tmp_buf[i0];
+				}
 				if (i1<0) {
 					i1 = 1 - i0;
-					sharp_scale_row(row_buf[i1], src + (sy+1)*src_pitch, scaled_w);
-					buf_sy[i1] = sy+1;
+					sharp_scale_row(tmp_buf[i1], src + (sy+1)*src_pitch, scaled_w);
+					row_sy[i1] = sy+1;
+					row_ptr[i1] = tmp_buf[i1];
 				}
-				uint32_t* r0 = row_buf[i0];
-				uint32_t* r1 = row_buf[i1];
-				for (int x=0; x<scaled_w; x++) d[x] = argb_blend(r0[x], r1[x], wy);
+				uint32_t* r0 = row_ptr[i0];
+				uint32_t* r1 = row_ptr[i1];
+				// wy is quantized to quarters: blend with shift-averages,
+				// no multiplies, and pick the variant once per row
+				#define AVG32(a,b) (((a)&(b)) + ((((a)^(b))>>1) & 0x7F7F7F7F))
+				if (wy==2) {
+					for (int x=0; x<scaled_w; x+=2) {
+						d[x]   = AVG32(r0[x],   r1[x]);
+						d[x+1] = AVG32(r0[x+1], r1[x+1]);
+					}
+				}
+				else if (wy==1) {
+					for (int x=0; x<scaled_w; x+=2) {
+						uint32_t m0 = AVG32(r0[x],   r1[x]);
+						uint32_t m1 = AVG32(r0[x+1], r1[x+1]);
+						d[x]   = AVG32(r0[x],   m0);
+						d[x+1] = AVG32(r0[x+1], m1);
+					}
+				}
+				else {
+					for (int x=0; x<scaled_w; x+=2) {
+						uint32_t m0 = AVG32(r0[x],   r1[x]);
+						uint32_t m1 = AVG32(r0[x+1], r1[x+1]);
+						d[x]   = AVG32(r1[x],   m0);
+						d[x+1] = AVG32(r1[x+1], m1);
+					}
+				}
+				#undef AVG32
 			}
 		}
 	}
