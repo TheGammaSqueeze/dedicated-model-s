@@ -1,7 +1,7 @@
-diff --git forkSrcPrefix/Makefile.libretro forkDstPrefix/Makefile.libretro
-index 184253889bf1bf7fb2afae4b7f60e2c21f32d967..05735f0a1491fc29dfd80449a7b329cf2d3fe886 100644
---- forkSrcPrefix/Makefile.libretro
-+++ forkDstPrefix/Makefile.libretro
+diff --git a/Makefile.libretro b/Makefile.libretro
+index 1842538..c6c892d 100644
+--- a/Makefile.libretro
++++ b/Makefile.libretro
 @@ -409,6 +409,19 @@ else ifeq ($(platform), miyoo)
     PLATFORM_DEFINES := -DDINGUX
     CFLAGS += -fomit-frame-pointer -ffast-math -march=armv5te -mtune=arm926ej-s
@@ -22,10 +22,22 @@ index 184253889bf1bf7fb2afae4b7f60e2c21f32d967..05735f0a1491fc29dfd80449a7b329cf
  
  # Windows MSVC 2003 Xbox 1
  else ifeq ($(platform), xbox1_msvc2003)
-diff --git forkSrcPrefix/libgambatte/libretro/libretro.cpp forkDstPrefix/libgambatte/libretro/libretro.cpp
-index 15b042cc291c675d90ba5481a112ec1742086084..fed178ecbb43db37ae58b4600833cc9864957cd1 100644
---- forkSrcPrefix/libgambatte/libretro/libretro.cpp
-+++ forkDstPrefix/libgambatte/libretro/libretro.cpp
+@@ -758,3 +771,11 @@ install: $(TARGET)
+ 
+ uninstall:
+ 	rm $(DESTDIR)$(core_installdir)/$(TARGET)
++
++# TRIMUI MODEL S: the generic release block above appends -O2 after the
++# platform section and the last -O flag wins, so re-override at the end
++ifeq ($(platform), trimui)
++CFLAGS   += -O3 -flto -fno-math-errno
++CXXFLAGS += -O3 -flto -fno-math-errno
++LDFLAGS  += -O3 -flto
++endif
+diff --git a/libgambatte/libretro/libretro.cpp b/libgambatte/libretro/libretro.cpp
+index 15b042c..fed178e 100644
+--- a/libgambatte/libretro/libretro.cpp
++++ b/libgambatte/libretro/libretro.cpp
 @@ -2009,7 +2009,7 @@ static enum gb_colorization_enable_type gb_colorization_enable = GB_COLORIZATION
  static std::string rom_path;
  static char internal_game_name[17];

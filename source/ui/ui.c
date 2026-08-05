@@ -1996,12 +1996,12 @@ static void sharp_init_axis(int* smap, uint32_t* wmap, int src_len, int dst_len)
 		if (f < 0) f = 0;
 		if (f > 1) f = 1;
 		if (s >= src_len-1) { s = src_len-1; f = 0; }
-		uint32_t w = (uint32_t)(f * 256.0f + 0.5f);
-		// snap the band edges: a <10% blend is invisible but costs a blend
-		if (w <= 24) w = 0;
-		else if (w >= 232) { s += 1; w = 0; }
+		// quantize to quarters: blends become shift-averages (no multiplies)
+		// and the <=1/8 band edges snap to plain nearest-neighbor
+		uint32_t q = (uint32_t)(f * 4.0f + 0.5f); // 0..4
+		if (q == 4) { s += 1; q = 0; }
 		smap[i] = s;
-		wmap[i] = w;
+		wmap[i] = q; // 0 = copy, 1..3 = quarter blend
 	}
 }
 
@@ -2014,12 +2014,7 @@ static inline uint32_t argb_blend(uint32_t a, uint32_t b, uint32_t w) { // w 0..
 	uint32_t g  = (((a & 0x00FF00) * iw + (b & 0x00FF00) * w) >> 8) & 0x00FF00;
 	return 0xFF000000 | rb | g;
 }
-static inline uint16_t blend565(uint16_t a, uint16_t b, uint32_t w) { // w 0..32
-	uint32_t ea = (a | (a << 16)) & 0x07E0F81F;
-	uint32_t eb = (b | (b << 16)) & 0x07E0F81F;
-	uint32_t r = ((ea * (32 - w) + eb * w) >> 5) & 0x07E0F81F;
-	return (uint16_t)(r | (r >> 16));
-}
+#define AVG565(a,b) ((uint16_t)((((a)&(b)) + ((((a)^(b))>>1) & 0x7BEF))))
 static void sharp_scale_row(uint32_t* dst, const uint16_t* src, int dst_len) {
 	int last_s = -1;
 	uint32_t last_c = 0;
@@ -2034,8 +2029,11 @@ static void sharp_scale_row(uint32_t* dst, const uint16_t* src, int dst_len) {
 			last_c = c;
 		}
 		else {
-			// blend the two taps in 565 first, convert once
-			c = rgb565_to_argb(blend565(src[s], src[s+1], w >> 3));
+			// w is quantized to quarters: blend the two taps in 565 with
+			// shift-averages (no multiplies), convert once
+			uint16_t a = src[s], b = src[s+1];
+			uint16_t m = AVG565(a,b);
+			c = rgb565_to_argb(w==2 ? m : w==1 ? AVG565(a,m) : AVG565(b,m));
 		}
 		dst[x] = c;
 	}
@@ -2071,17 +2069,6 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 			sharp_init_axis(sharp_sx, sharp_wx, width, scaled_w);
 			sharp_init_axis(sharp_sy, sharp_wy, height, scaled_h);
-
-			// quantize vertical weights to quarters so boundary rows can
-			// blend with shift-averages instead of per-pixel multiplies
-			for (int y=0; y<scaled_h; y++) {
-				uint32_t w = sharp_wy[y];
-				if (!w) continue;
-				uint32_t q = (w + 32) >> 6; // 0..4
-				if (q == 0) sharp_wy[y] = 0;
-				else if (q == 4) { sharp_sy[y] += 1; sharp_wy[y] = 0; }
-				else sharp_wy[y] = q; // 1..3 quarters
-			}
 		}
 		else {
 			scaled_w = width;
