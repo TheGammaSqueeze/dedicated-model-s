@@ -1963,7 +1963,7 @@ static bool environment_callback(unsigned cmd, void *data) {
 // pure NN). Weights are per-axis constants for a given resolution so they
 // are precomputed once per layer size. GBA stays on the stock hardware
 // path, CPU scaling at 240x160 costs more than it can spare.
-#define SHARP_WINDOW 2.0f // transition = (1/SHARP_WINDOW) dst pixels wide
+#define SHARP_WINDOW 2.5f // transition = (1/SHARP_WINDOW) dst pixels wide
 
 static int scaled_w = 0; // on-screen size of the game frame
 static int scaled_h = 0;
@@ -2001,6 +2001,12 @@ static inline uint32_t argb_blend(uint32_t a, uint32_t b, uint32_t w) { // w 0..
 	uint32_t g  = (((a & 0x00FF00) * iw + (b & 0x00FF00) * w) >> 8) & 0x00FF00;
 	return 0xFF000000 | rb | g;
 }
+static inline uint16_t blend565(uint16_t a, uint16_t b, uint32_t w) { // w 0..32
+	uint32_t ea = (a | (a << 16)) & 0x07E0F81F;
+	uint32_t eb = (b | (b << 16)) & 0x07E0F81F;
+	uint32_t r = ((ea * (32 - w) + eb * w) >> 5) & 0x07E0F81F;
+	return (uint16_t)(r | (r >> 16));
+}
 static void sharp_scale_row(uint32_t* dst, const uint16_t* src, int dst_len) {
 	int last_s = -1;
 	uint32_t last_c = 0;
@@ -2015,7 +2021,8 @@ static void sharp_scale_row(uint32_t* dst, const uint16_t* src, int dst_len) {
 			last_c = c;
 		}
 		else {
-			c = argb_blend(rgb565_to_argb(src[s]), rgb565_to_argb(src[s+1]), w);
+			// blend the two taps in 565 first, convert once
+			c = rgb565_to_argb(blend565(src[s], src[s+1], w >> 3));
 		}
 		dst[x] = c;
 	}
