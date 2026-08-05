@@ -1897,6 +1897,8 @@ static void log_callback(enum retro_log_level level, const char *fmt, ...) {
 	va_end(args);
 }
 static int core_options_dirty = 0;
+static struct retro_audio_buffer_status_callback audio_status = {0};
+static int frame_behind = 0; // set by frame_pacing_update, read by App_render
 static bool environment_callback(unsigned cmd, void *data) {
 	switch (cmd) {
 		case RETRO_ENVIRONMENT_SET_MESSAGE: {
@@ -1907,6 +1909,10 @@ static bool environment_callback(unsigned cmd, void *data) {
 		case RETRO_ENVIRONMENT_GET_LOG_INTERFACE: {
 			struct retro_log_callback *log = (struct retro_log_callback *)data;
 			if (log) log->log = log_callback;
+			return true;
+		}
+		case RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK: {
+			audio_status.callback = data ? ((const struct retro_audio_buffer_status_callback *)data)->callback : NULL;
 			return true;
 		}
 		case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: {
@@ -1941,10 +1947,15 @@ static bool environment_callback(unsigned cmd, void *data) {
 			}
 			else if (strcmp(var->key, "gpsp_frameskip") == 0) {
 				has_frameskip = 1;
-				var->value = settings.frameskip ? "fixed_interval" : "disabled";
+				// auto only skips when the frontend reports an imminent
+				// audio underrun (see audio_status_notify)
+				var->value = settings.frameskip ? "fixed_interval" : "auto";
 			}
 			else if (strcmp(var->key, "gpsp_frameskip_interval") == 0) {
 				var->value = "1";
+			}
+			else if (strcmp(var->key, "gpsp_sound_rate") == 0) {
+				var->value = "32768"; // half the mixing cost of the 65536 default
 			}
 			
 			// pokemini
@@ -4103,7 +4114,54 @@ static void App_render(void) {
 		}
 	}
 
-	present_layers(fastforward ? VSYNC_NONE : VSYNC_WAIT);
+	// a frame that already ran over its budget skips the vsync wait so it
+	// only pays its real overrun, not a whole extra refresh period
+	present_layers((fastforward || frame_behind) ? VSYNC_NONE : VSYNC_WAIT);
+}
+
+// frame pacing: measure real iteration time against the frame budget and
+// (1) skip the vsync wait after a frame that ran over, so a 1ms miss costs
+// 1ms instead of quantizing to a whole extra refresh period, and (2) feed
+// the core's auto-frameskip with single-frame pulses from a time-debt
+// accumulator: each pulse skips exactly one frame, so skipping matches the
+// measured deficit instead of latching for FRAMESKIP_MAX (30!) frames the
+// way a level-triggered signal does.
+static void frame_pacing_update(void) {
+	static uint32_t prev_ms = 0;
+	static float debt = 0;
+
+	uint32_t now = SDL_GetTicks();
+	uint32_t dt = prev_ms ? now - prev_ms : 0;
+	prev_ms = now;
+
+	float budget = core.fps > 0 ? (float)(1000.0 / core.fps) : 16.7f;
+	if (dt == 0 || dt > 100) dt = (uint32_t)budget; // first frame, menus, load hitches
+
+	frame_behind = dt > budget + 3.0f;
+
+	debt += (float)dt - budget;
+	if (debt < 0) debt = 0;               // running fast pays nothing forward
+	if (debt > budget*3) debt = budget*3; // cap the burst after a long spell
+
+	// space pulses at least two rendered frames apart: games that draw
+	// alternating-frame sprites (pseudo-transparency) get both phases
+	// rendered between skips, so they shimmer instead of vanishing
+	static int since_skip = 2;
+	int pulse = 0;
+	if (debt >= budget && since_skip >= 2) {
+		pulse = 1;
+		since_skip = 0;
+		debt -= budget;
+	}
+	else if (since_skip < 2) {
+		since_skip++;
+	}
+
+	if (audio_status.callback) {
+		int active = snd.frame_count > 0 && !fastforward;
+		unsigned occupancy = snd.frame_count > 1 ? (unsigned)(SND_availableToRead()*100 / (snd.frame_count-1)) : 0;
+		audio_status.callback(active, occupancy, active && pulse);
+	}
 }
 
 int main(void) {
@@ -4118,6 +4176,7 @@ int main(void) {
 		Game_open();
 
 		while (!app.quit && !app.reload) {
+			frame_pacing_update();
 			core.run();
 			if (app.reload) break;
 			App_render();

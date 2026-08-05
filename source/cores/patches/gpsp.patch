@@ -1,8 +1,8 @@
 diff --git a/Makefile b/Makefile
-index f5e3bf2..5a3f281 100644
+index f5e3bf2..6764025 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -536,6 +536,19 @@ else ifeq ($(platform), miyoomini)
+@@ -536,6 +536,21 @@ else ifeq ($(platform), miyoomini)
  	ARCH = arm
  	BUILTIN_GPU = neon
  
@@ -16,6 +16,8 @@ index f5e3bf2..5a3f281 100644
 +  SHARED := -shared -nostdlib -Wl,-version-script=link.T
 +  CFLAGS += -fomit-frame-pointer -ffast-math -march=armv5te -mtune=arm926ej-s
 +  CFLAGS += -DSMALL_TRANSLATION_CACHE
++  CFLAGS += -flto
++  LDFLAGS += -flto
 +  HAVE_DYNAREC := 1
 +  CPU_ARCH := arm
 +  
