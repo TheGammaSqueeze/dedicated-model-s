@@ -1912,6 +1912,7 @@ static int core_options_dirty = 0;
 static struct retro_audio_buffer_status_callback audio_status = {0};
 static int frame_behind = 0;   // set by frame_pacing_update, read by App_render
 static int frame_rendered = 0; // did the core deliver video this iteration?
+static int audio_starved = 0;  // audio cushion below target, run vsync-free to refill
 static bool environment_callback(unsigned cmd, void *data) {
 	switch (cmd) {
 		case RETRO_ENVIRONMENT_SET_MESSAGE: {
@@ -4147,7 +4148,7 @@ static void App_render(void) {
 	// vsync would make the skip cost a full period of wall time and defeat
 	// its purpose: present immediately so the skip actually buys catch-up
 	// time (no tearing either, the game layer was not touched).
-	present_layers((fastforward || frame_behind || !frame_rendered) ? VSYNC_NONE : VSYNC_WAIT);
+	present_layers((fastforward || frame_behind || !frame_rendered || audio_starved) ? VSYNC_NONE : VSYNC_WAIT);
 }
 
 // frame pacing: measure real iteration time against the frame budget and
@@ -4170,27 +4171,48 @@ static void frame_pacing_update(void) {
 	float budget = core.fps > 0 ? (float)(1000.0 / core.fps) : 16.7f;
 	if (dt == 0 || dt > 100) dt = (uint32_t)budget; // first frame, menus, load hitches
 
-	frame_behind = dt > budget + 3.0f;
+	frame_behind = dt > budget + 2.0f;
 
-	debt += (float)dt - budget;
-	if (debt < 0) debt = 0;               // running fast pays nothing forward
-	if (debt > budget*3) debt = budget*3; // cap the burst after a long spell
-
-	// space pulses at least two rendered frames apart so games that draw
-	// alternating-frame sprites (pseudo-transparency) get both phases on
-	// screen; under a heavy deficit escalate to every other frame. Note
-	// skipping only reclaims rendering time: a scene whose emulation alone
-	// exceeds the budget stays slow no matter how much video is dropped.
-	static int since_skip = 2;
-	int min_gap = debt >= budget*2 ? 1 : 2;
-	int pulse = 0;
-	if (debt >= budget && since_skip >= min_gap) {
-		pulse = 1;
-		since_skip = 0;
-		debt -= budget;
+	// audio cushion with wide hysteresis: engage vsync-free refill only
+	// when the ring drops under ~3 frames of audio and keep refilling
+	// until ~10, so a refill is one rare brief burst. A narrow threshold
+	// here flaps between locked and free-running every few frames, and
+	// each re-lock waits out a partial refresh period, which both starves
+	// the ring at its floor and injects phantom slow frames.
+	int spf = (snd.frame_count > 0 && core.fps > 0) ? (int)(snd.sample_rate_in / core.fps) : 0;
+	if (spf > 0 && !fastforward) {
+		int avail = SND_availableToRead();
+		if (audio_starved) audio_starved = avail < spf*10;
+		else               audio_starved = avail < spf*3;
 	}
-	else if (since_skip < 2) {
-		since_skip++;
+	else audio_starved = 0;
+
+	// closed loop: debt is paid down only by frames that actually complete
+	// under budget (skipped frames are fast, so each skip repays its real
+	// saving). On-pace frames also decay a quarter frame extra so skipping
+	// stops promptly after a heavy scene instead of lingering.
+	debt += (float)dt - budget;
+	if (dt <= budget + 0.5f) debt -= budget*0.25f;
+	if (debt < 0) debt = 0;
+	if (debt > budget*4) debt = budget*4;
+
+	// pulse at a full frame of debt (anything lower reacts to vsync
+	// realignment noise, not real load), escalating with the deficit up
+	// to 3 skips in 4 (never more than 3 consecutive, so video always
+	// advances). Note skipping only reclaims rendering time: a scene
+	// whose emulation alone exceeds the budget stays slow regardless.
+	static int since_skip = 2;
+	static int consec = 0;
+	int min_gap = debt >= budget*2.5f ? 0 : debt >= budget*1.5f ? 1 : 2;
+	int pulse = 0;
+	if (debt >= budget && since_skip >= min_gap && consec < 3) {
+		pulse = 1;
+		consec++;
+		since_skip = 0;
+	}
+	else {
+		consec = 0;
+		if (since_skip < 4) since_skip++;
 	}
 
 	if (audio_status.callback) {
