@@ -257,7 +257,8 @@ static struct {
 	uint32_t brightness;	// 0 - 10
 	uint32_t frameskip;
 	uint32_t datetime;
-	uint32_t unused[3];
+	uint32_t sharp;			// GB/GBC software sharp scaling (0 = stock hardware bilinear)
+	uint32_t unused[2];
 	char game[MAX_PATH];
 } settings = {
 	.version = 1,
@@ -1963,7 +1964,23 @@ static bool environment_callback(unsigned cmd, void *data) {
 // pure NN). Weights are per-axis constants for a given resolution so they
 // are precomputed once per layer size. GBA stays on the stock hardware
 // path, CPU scaling at 240x160 costs more than it can spare.
-#define SHARP_WINDOW 2.0f // transition = (1/SHARP_WINDOW) dst pixels wide
+// transition = (1/sharp_window) dst pixels wide; adjustable in game with
+// MENU+A (+0.1, sharper) and MENU+Y (-0.1, softer), not persisted
+#define SHARP_WINDOW_DEFAULT	2.0f
+#define SHARP_WINDOW_MIN		1.0f
+#define SHARP_WINDOW_MAX		8.0f
+static float sharp_window = SHARP_WINDOW_DEFAULT;
+
+// MENU+X cycles the display mode (not persisted): aspect fit (default),
+// 1x integer centered, 2x integer (center-cropped when it overscans)
+enum {
+	DISPMODE_FIT = 0,
+	DISPMODE_1X,
+	DISPMODE_2X,
+
+	DISPMODE_COUNT,
+};
+static int display_mode = DISPMODE_FIT;
 
 static int scaled_w = 0; // on-screen size of the game frame
 static int scaled_h = 0;
@@ -1993,7 +2010,7 @@ static void sharp_init_axis(int* smap, uint32_t* wmap, int src_len, int dst_len)
 		if (pos < 0) pos = 0;
 		int s = (int)pos;
 		float frac = pos - s;
-		float f = (frac - 0.5f) * scale * SHARP_WINDOW + 0.5f;
+		float f = (frac - 0.5f) * scale * sharp_window + 0.5f;
 		if (f < 0) f = 0;
 		if (f > 1) f = 1;
 		if (s >= src_len-1) { s = src_len-1; f = 0; }
@@ -2051,11 +2068,25 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 		framebuffer = NULL;
 	}
 
-	int sharp = (width==160 && height==144); // GB/GBC only
+	// sharp scaling is opt-in (MENU+B in game); default is the stock
+	// hardware bilinear path
+	int sharp = display_mode==DISPMODE_FIT && settings.sharp && width==160 && height==144; // GB/GBC only
+	static int last_sharp = -1;
+	static float last_window = 0;
+	static int last_mode = -1;
+	static int crop_x = 0, crop_y = 0; // 2x mode source crop
 
 	if (!framebuffer) {
 		framebuffer = SDL_CreateRGBSurfaceFrom(NULL, width, height, 16, pitch, RGB565_MASKS);
 		lut_init();
+		last_sharp = -1;
+		last_mode = -1;
+	}
+
+	if (sharp != last_sharp || display_mode != last_mode || (sharp && sharp_window != last_window)) {
+		last_sharp = sharp;
+		last_mode = display_mode;
+		last_window = sharp_window;
 
 		if (sharp) {
 			// aspect-fit size, rounded to even for the display engine; the
@@ -2072,7 +2103,14 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 			sharp_init_axis(sharp_sx, sharp_wx, width, scaled_w);
 			sharp_init_axis(sharp_sy, sharp_wy, height, scaled_h);
 		}
-		else {
+		else if (display_mode==DISPMODE_2X) {
+			// 2x pixel doubling, center-cropped where it overscans
+			scaled_w = width*2  > SCREEN_WIDTH  ? SCREEN_WIDTH  : width*2;
+			scaled_h = height*2 > SCREEN_HEIGHT ? SCREEN_HEIGHT : height*2;
+			crop_x = (width  - scaled_w/2) / 2;
+			crop_y = (height - scaled_h/2) / 2;
+		}
+		else { // native buffer: FIT stretches via the hardware, 1X shows it centered
 			scaled_w = width;
 			scaled_h = height;
 		}
@@ -2082,8 +2120,35 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	// the blit below is only valid when the layer matches the scaled frame
 	if (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h) reinit_layer(scaled_w, scaled_h);
 
+	// the integer modes must be shown 1:1; reinit_layer stretches to fit the
+	// screen, so pin the window back to the buffer size after any reinit
+	if (display_mode!=DISPMODE_FIT && (sc_info.screen_win.width!=(unsigned)scaled_w || sc_info.screen_win.height!=(unsigned)scaled_h)) {
+		resize_scaler((SCREEN_WIDTH-scaled_w)/2, (SCREEN_HEIGHT-scaled_h)/2, scaled_w, scaled_h);
+	}
+
 	framebuffer->pixels = (void*)data;
-	if (!sharp) {
+	if (display_mode==DISPMODE_2X) {
+		// cropped nearest-neighbor 2x: convert once, write a doubled pair,
+		// then duplicate the row
+		int cw = scaled_w/2;
+		int ch = scaled_h/2;
+		int dst_pitch = scaler->pitch / 4;
+		int src_pitch = pitch / 2;
+		uint32_t* dst = (uint32_t*)scaler->pixels;
+		const uint16_t* src = (const uint16_t*)data + crop_y*src_pitch + crop_x;
+		for (int y=0; y<ch; y++) {
+			const uint16_t* s = src + y*src_pitch;
+			uint32_t* d = dst + (y*2)*dst_pitch;
+			uint32_t* p = d;
+			for (int x=0; x<cw; x++) {
+				uint32_t c = rgb565_to_argb(s[x]);
+				*p++ = c;
+				*p++ = c;
+			}
+			memcpy(d + dst_pitch, d, scaled_w*4);
+		}
+	}
+	else if (!sharp) {
 		// 1:1 convert blit via the LUTs, faster than SDL's generic converter
 		int dst_pitch = scaler->pitch / 4;
 		int src_pitch = pitch / 2;
@@ -3875,6 +3940,33 @@ static int App_listen(void) {
 		}
 		
 		if (!ui.menu) {
+			if (Pad_justPressed(PAD_B)) {
+				Pad_consume(PAD_B);
+				ignore_menu = 1;
+				settings.sharp = !settings.sharp;
+			}
+
+			if (Pad_justPressed(PAD_X)) {
+				Pad_consume(PAD_X);
+				ignore_menu = 1;
+				display_mode = (display_mode + 1) % DISPMODE_COUNT;
+			}
+
+			if (settings.sharp) {
+				if (Pad_justRepeated(PAD_A)) {
+					Pad_consume(PAD_A);
+					ignore_menu = 1;
+					sharp_window += 0.1f;
+					if (sharp_window > SHARP_WINDOW_MAX) sharp_window = SHARP_WINDOW_MAX;
+				}
+				if (Pad_justRepeated(PAD_Y)) {
+					Pad_consume(PAD_Y);
+					ignore_menu = 1;
+					sharp_window -= 0.1f;
+					if (sharp_window < SHARP_WINDOW_MIN) sharp_window = SHARP_WINDOW_MIN;
+				}
+			}
+
 			if (Pad_justPressed(PAD_L1)) {
 				Pad_consume(PAD_L1);
 				ignore_menu = 1;

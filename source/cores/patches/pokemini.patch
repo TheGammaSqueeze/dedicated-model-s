@@ -1,7 +1,7 @@
-diff --git forkSrcPrefix/Makefile.libretro forkDstPrefix/Makefile.libretro
-index 9660e99e3c4a2d22bf2918e4dc2781a481d8b060..3ab75c1de196add572d6e6af8cf1ed6b0c39e255 100644
---- forkSrcPrefix/Makefile.libretro
-+++ forkDstPrefix/Makefile.libretro
+diff --git a/Makefile.libretro b/Makefile.libretro
+index 9660e99..cca6dad 100644
+--- a/Makefile.libretro
++++ b/Makefile.libretro
 @@ -484,6 +484,17 @@ else ifeq ($(platform), miyoo)
  	CFLAGS += -ffast-math -fomit-frame-pointer -march=armv5te -mtune=arm926ej-s
  	CFLAGS += -DDINGUX -DRS90
@@ -20,3 +20,13 @@ index 9660e99e3c4a2d22bf2918e4dc2781a481d8b060..3ab75c1de196add572d6e6af8cf1ed6b
  # GCW0
  else ifeq ($(platform), gcw0)
  	TARGET := $(TARGET_NAME)_libretro.so
+@@ -727,3 +738,9 @@ endif
+ 
+ endif
+ 
++
++# TRIMUI MODEL S: the generic release block appends -O2 after the platform
++# section and the last -O flag wins, so re-override at the end
++ifeq ($(platform), trimui)
++CFLAGS += -O3
++endif
