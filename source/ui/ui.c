@@ -1977,15 +1977,16 @@ static uint32_t sharp_wy[SCREEN_HEIGHT];
 // pays more for the bitfield shuffle than for three loads
 static uint32_t lut_r[32], lut_g[64], lut_b[32];
 
-static void sharp_init_axis(int* smap, uint32_t* wmap, int src_len, int dst_len) {
+static void lut_init(void) {
 	static int lut_ready = 0;
-	if (!lut_ready) {
-		lut_ready = 1;
-		for (int i=0; i<32; i++) lut_r[i] = 0xFF000000 | (((i<<3)|(i>>2)) << 16);
-		for (int i=0; i<64; i++) lut_g[i] = ((i<<2)|(i>>4)) << 8;
-		for (int i=0; i<32; i++) lut_b[i] = (i<<3)|(i>>2);
-	}
+	if (lut_ready) return;
+	lut_ready = 1;
+	for (int i=0; i<32; i++) lut_r[i] = 0xFF000000 | (((i<<3)|(i>>2)) << 16);
+	for (int i=0; i<64; i++) lut_g[i] = ((i<<2)|(i>>4)) << 8;
+	for (int i=0; i<32; i++) lut_b[i] = (i<<3)|(i>>2);
+}
 
+static void sharp_init_axis(int* smap, uint32_t* wmap, int src_len, int dst_len) {
 	float scale = (float)dst_len / src_len;
 	for (int i=0; i<dst_len; i++) {
 		float pos = (i + 0.5f) / scale - 0.5f;
@@ -2054,6 +2055,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 	if (!framebuffer) {
 		framebuffer = SDL_CreateRGBSurfaceFrom(NULL, width, height, 16, pitch, RGB565_MASKS);
+		lut_init();
 
 		if (sharp) {
 			// aspect-fit size, rounded to even for the display engine; the
@@ -2082,7 +2084,19 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 	framebuffer->pixels = (void*)data;
 	if (!sharp) {
-		SDL_BlitSurface(framebuffer, &(SDL_Rect){0,0,width,height}, scaler, &(SDL_Rect){(SCALER_WIDTH-width)/2,(SCALER_HEIGHT-height)/2});
+		// 1:1 convert blit via the LUTs, faster than SDL's generic converter
+		int dst_pitch = scaler->pitch / 4;
+		int src_pitch = pitch / 2;
+		uint32_t* dst = (uint32_t*)scaler->pixels;
+		const uint16_t* src = (const uint16_t*)data;
+		for (unsigned y=0; y<height; y++) {
+			const uint16_t* s = src + y*src_pitch;
+			uint32_t* d = dst + y*dst_pitch;
+			for (unsigned x=0; x<width; x+=2) {
+				d[x]   = rgb565_to_argb(s[x]);
+				d[x+1] = rgb565_to_argb(s[x+1]);
+			}
+		}
 	}
 	else {
 		// unique source rows are scaled straight into their first dst row

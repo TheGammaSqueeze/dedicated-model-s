@@ -1,7 +1,7 @@
-diff --git forkSrcPrefix/Makefile forkDstPrefix/Makefile
-index f5e3bf2e347c24fdc6bea0b9149ba867ed0c1abf..5a3f2817f7f520e5460aedecdeb90a2e16cda68d 100644
---- forkSrcPrefix/Makefile
-+++ forkDstPrefix/Makefile
+diff --git a/Makefile b/Makefile
+index f5e3bf2..5a3f281 100644
+--- a/Makefile
++++ b/Makefile
 @@ -536,6 +536,19 @@ else ifeq ($(platform), miyoomini)
  	ARCH = arm
  	BUILTIN_GPU = neon
@@ -22,3 +22,18 @@ index f5e3bf2e347c24fdc6bea0b9149ba867ed0c1abf..5a3f2817f7f520e5460aedecdeb90a2e
  # Windows
  else
  	TARGET := $(TARGET_NAME)_libretro.dll
+diff --git a/gpsp_config.h b/gpsp_config.h
+index 625f46e..99f4780 100644
+--- a/gpsp_config.h
++++ b/gpsp_config.h
+@@ -13,8 +13,8 @@
+ 
+ /* Cache sizes and their config knobs */
+ #if defined(SMALL_TRANSLATION_CACHE)
+-  #define ROM_TRANSLATION_CACHE_SIZE (1024 * 1024 * 2)
+-  #define RAM_TRANSLATION_CACHE_SIZE (1024 * 384)
++  #define ROM_TRANSLATION_CACHE_SIZE (1024 * 1024 * 4)
++  #define RAM_TRANSLATION_CACHE_SIZE (1024 * 512)
+ #else
+   #define ROM_TRANSLATION_CACHE_SIZE (1024 * 1024 * 10)
+   #define RAM_TRANSLATION_CACHE_SIZE (1024 * 512)
