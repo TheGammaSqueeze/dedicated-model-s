@@ -1996,7 +1996,15 @@ static bool environment_callback(unsigned cmd, void *data) {
 			else if (strcmp(var->key, "gpsp_sound_rate") == 0) {
 				var->value = "32768"; // half the mixing cost of the 65536 default
 			}
-			
+
+			// picodrive: auto frameskip, driven by the frontend's audio
+			// buffer status callback (our frame pacing), so heavy Genesis
+			// scenes drop frames instead of slowing down
+			else if (strcmp(var->key, "picodrive_frameskip") == 0) {
+				has_frameskip = 1;
+				var->value = "auto";
+			}
+
 			// pokemini
 			else if (strcmp(var->key, "pokemini_video_scale") == 0) {
 				var->value = "2x";
@@ -2161,7 +2169,11 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	// the 565 scaler is pure 16-bit gathers with no color conversion, so it
 	// costs about the same as the stock convert blit; enabled per console
 	// via settings.sharp, keyed on g_sharp_bit set at core-select time
-	int sharp = (display_mode==DISPMODE_FIT || display_mode==DISPMODE_FIT_43) && g_sharp_bit>=0 &&
+	// content already at panel width (e.g. Genesis H40 320x224) in fit mode
+	// is shown as native 565 1:1 through the DEBE layer: no scaler, no
+	// bilinear, no conversion, just a row copy - both unfiltered and fastest
+	int native_11 = display_mode==DISPMODE_FIT && width==SCREEN_WIDTH && height<=SCREEN_HEIGHT;
+	int sharp = !native_11 && (display_mode==DISPMODE_FIT || display_mode==DISPMODE_FIT_43) && g_sharp_bit>=0 &&
 		(settings.sharp & (1u << g_sharp_bit)) && width<=SCREEN_WIDTH && height<=SCREEN_HEIGHT;
 	static int last_sharp = -1;
 	static float last_window = 0;
@@ -2231,7 +2243,8 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 	// menu previews and game switching can leave the layer at another size;
 	// the blit below is only valid when the layer matches the scaled frame
-	if (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=(sharp?16:32)) reinit_layer(scaled_w, scaled_h, sharp?16:32);
+	int game_bpp16 = sharp || native_11; // both use the native-565 DEBE layer
+	if (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=(game_bpp16?16:32)) reinit_layer(scaled_w, scaled_h, game_bpp16?16:32);
 
 	// set the hardware output window for the current mode (checked every
 	// frame, but the ioctl only fires when it actually changes): aspect fit
@@ -2260,7 +2273,16 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	frame_rendered = 1;
 
 	framebuffer->pixels = (void*)data;
-	if (display_mode==DISPMODE_2X) {
+	if (native_11) {
+		// straight 565 row copy into the DEBE layer, shown 1:1, unfiltered
+		int dst_pitch = scaler->pitch / 2;
+		int src_pitch = pitch / 2;
+		uint16_t* dst = (uint16_t*)scaler->pixels;
+		const uint16_t* src = (const uint16_t*)data;
+		for (unsigned y=0; y<height; y++)
+			memcpy(dst + y*dst_pitch, src + y*src_pitch, width*2);
+	}
+	else if (display_mode==DISPMODE_2X) {
 		// cropped nearest-neighbor 2x: convert once, write a doubled pair,
 		// then duplicate the row
 		int cw = scaled_w/2;
@@ -4067,10 +4089,12 @@ static void App_menu(void) {
 	if (ui.osd==OSD_NONE) disable_overlay();
 	invalidate_overlay = 1;
 
-	// restore the layer to the on-screen frame size and mode (sharp GB/GBC
-	// renders 565 into a normal-mode layer, everything else scaler ARGB)
-	int game_bpp = ((display_mode==DISPMODE_FIT || display_mode==DISPMODE_FIT_43) && g_sharp_bit>=0 &&
-		(settings.sharp & (1u << g_sharp_bit))) ? 16 : 32;
+	// restore the layer to the on-screen frame size and mode (sharp and the
+	// native-565 320-wide fit path use the normal-mode 565 layer, else ARGB)
+	int fb_native11 = framebuffer && display_mode==DISPMODE_FIT &&
+		framebuffer->w==SCREEN_WIDTH && framebuffer->h<=SCREEN_HEIGHT;
+	int game_bpp = (fb_native11 || ((display_mode==DISPMODE_FIT || display_mode==DISPMODE_FIT_43) && g_sharp_bit>=0 &&
+		(settings.sharp & (1u << g_sharp_bit)))) ? 16 : 32;
 	if (!app.quit && !app.reload && scaled_w && (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=game_bpp)) {
 		present_layers(VSYNC_WAIT);
 		reinit_layer(scaled_w, scaled_h, game_bpp);
