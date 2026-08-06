@@ -270,7 +270,7 @@ static struct {
 	uint32_t frameskip;
 	uint32_t datetime;
 	uint32_t sharp;			// per-console sharp-scaling bitmask (0 = stock hardware bilinear); see SHARPBIT_*
-	uint32_t sharp_resv;	// reserved (was a second sharp flag); kept so settings.bin layout is unchanged
+	uint32_t saturation;	// per-core-slot saturation level, 4 bits each (0 off .. 3 high); see g_sat_slot
 	uint32_t lcdfx;			// LCD overlay: 0 off, 1-3 scanlines, 4-6 grid (weak to strong)
 	char game[MAX_PATH];
 } settings = {
@@ -278,6 +278,11 @@ static struct {
 	.volume = 10,
 	.brightness = 4,
 };
+
+// saturation storage slot for the running core (-1 = core has no saturation
+// support): 0 = picodrive (MD/SMS/GG), 1 = quicknes (NES). Set at core-select.
+static int g_sat_slot = -1;
+static int Sat_level(void) { return g_sat_slot < 0 ? 0 : (settings.saturation >> (g_sat_slot*4)) & 0xF; }
 
 #define SETTINGS_PATH USERDATA_PATH "/settings.bin"
 static void Settings_load(void) {
@@ -2005,6 +2010,15 @@ static bool environment_callback(unsigned cmd, void *data) {
 				var->value = "auto";
 			}
 
+			// saturation baked into the core palette (see g_sat_slot);
+			// digit string, level 0 off .. 3 high
+			else if (strcmp(var->key, "picodrive_saturation") == 0 ||
+					 strcmp(var->key, "quicknes_saturation") == 0) {
+				static const char *lv[] = { "0","1","2","3","4","5","6","7","8","9" };
+				int n = Sat_level();
+				var->value = lv[n < 10 ? n : 0];
+			}
+
 			// pokemini
 			else if (strcmp(var->key, "pokemini_video_scale") == 0) {
 				var->value = "2x";
@@ -2820,6 +2834,7 @@ typedef enum {
 	ITEM_RESET,
 	ITEM_CPU,
 	ITEM_LCD,
+	ITEM_SAT,
 } MenuItem;
 typedef enum {
 	PREVIEW_CURRENT,
@@ -2834,6 +2849,7 @@ static MenuItem current_items[] = {
 	ITEM_RESET,
 	ITEM_CPU,
 	ITEM_LCD,
+	ITEM_SAT,
 };
 static MenuItem other_items[] = {
 	ITEM_LOAD,
@@ -2865,6 +2881,14 @@ static const char *Menu_getItemName(MenuItem item) {
 			static char name[16];
 			if (!settings.lcdfx) return "LCD OFF";
 			sprintf(name, "LCD %s %u", settings.lcdfx<=3 ? "SCAN" : "GRID", (settings.lcdfx-1)%3+1);
+			return name;
+		}
+		case ITEM_SAT: {
+			static char name[20];
+			if (g_sat_slot < 0) return "SATURATION N/A";
+			int n = Sat_level();
+			if (!n) return "SATURATION OFF";
+			sprintf(name, "SATURATION %d", n);
 			return name;
 		}
 	}
@@ -3267,6 +3291,7 @@ static void App_selectCore(void) {
 	strcpy(core.name, console->core);
 	sprintf(core.path, "%s/%s_libretro.so", CORES_PATH, core.name);
 	g_sharp_bit = console->sharp_bit;
+	g_sat_slot = strcmp(core.name,"picodrive")==0 ? 0 : strcmp(core.name,"quicknes")==0 ? 1 : -1;
 
 	LOG("core.path: %s", core.path);
 	LOG("core.name: %s", core.name);
@@ -3823,7 +3848,16 @@ static void App_menu(void) {
 						settings.lcdfx = (settings.lcdfx + 1) % 7;
 						menu.dirty = 1;
 					}
-					if (item!=ITEM_ARCHIVE && item!=ITEM_CPU && item!=ITEM_LCD) Menu_quit();
+					else if (item==ITEM_SAT) {
+						if (g_sat_slot >= 0) {
+							int n = (Sat_level() + 1) % 4; // off, 1, 2, 3
+							settings.saturation = (settings.saturation & ~(0xFu << (g_sat_slot*4)))
+								| ((uint32_t)n << (g_sat_slot*4));
+							core_options_dirty = 1; // core re-reads and rebuilds its palette
+						}
+						menu.dirty = 1;
+					}
+					if (item!=ITEM_ARCHIVE && item!=ITEM_CPU && item!=ITEM_LCD && item!=ITEM_SAT) Menu_quit();
 				}
 				else {
 					if (item==ITEM_LOAD) {

@@ -20,3 +20,101 @@ index b6e583f..9fe5d10 100644
  else ifeq ($(platform), miyoo)
  	TARGET := $(TARGET_NAME)_libretro.so
  	CC = /opt/miyoo/usr/bin/arm-linux-gcc
+diff --git a/pico/draw.c b/pico/draw.c
+index 526f18e..0694854 100644
+--- a/pico/draw.c
++++ b/pico/draw.c
+@@ -1973,6 +1973,23 @@ void PicoDrawBgcDMA(u16 *base, u32 source, u32 mask, int dlen, int sl)
+ }
+ 
+ // also works for fast renderer
++// runtime saturation applied to the finished palette (0 = off). Baked into
++// HighPal when it is rebuilt, so per-pixel rendering cost is unchanged.
++int pico_saturation = 0;
++unsigned short pico_sat565(unsigned short c)
++{
++  int f = 256 + pico_saturation * 40; // 1 = ~1.16x, up per level
++  int r = ((c >> 11) & 0x1f) << 3, g = ((c >> 5) & 0x3f) << 2, b = (c & 0x1f) << 3;
++  int y = (r * 77 + g * 150 + b * 29) >> 8;
++  int nr = y + (((r - y) * f) >> 8);
++  int ng = y + (((g - y) * f) >> 8);
++  int nb = y + (((b - y) * f) >> 8);
++  if (nr < 0) nr = 0; else if (nr > 255) nr = 255;
++  if (ng < 0) ng = 0; else if (ng > 255) ng = 255;
++  if (nb < 0) nb = 0; else if (nb > 255) nb = 255;
++  return ((nr >> 3) << 11) | ((ng >> 2) << 5) | (nb >> 3);
++}
++
+ void PicoDrawUpdateHighPal(void)
+ {
+   struct PicoEState *est = &Pico.est;
+@@ -1995,6 +2012,12 @@ void PicoDrawUpdateHighPal(void)
+     }
+     est->HighPal[0xe0] = 0x0000; // black and white, reserved for OSD
+     est->HighPal[0xf0] = 0xffff;
++
++    if (pico_saturation) {
++      int j;
++      for (j = 0; j < 0xe0; j++)
++        est->HighPal[j] = pico_sat565(est->HighPal[j]);
++    }
+   }
+ }
+ 
+diff --git a/pico/mode4.c b/pico/mode4.c
+index 0ddb9b3..d981e25 100644
+--- a/pico/mode4.c
++++ b/pico/mode4.c
+@@ -12,6 +12,9 @@
+ #include "pico_int.h"
+ #include <platform/common/upscale.h>
+ 
++extern int pico_saturation;                 /* pico/draw.c */
++extern unsigned short pico_sat565(unsigned short); /* pico/draw.c */
++
+ static void (*FinalizeLineSMS)(int line);
+ static int skip_next_line;
+ static int screen_offset, line_offset;
+@@ -914,6 +917,12 @@ void PicoDoHighPal555SMS(void)
+     spal += 0x20/2, dpal += 0x20/2;
+   }
+   Pico.est.HighPal[0xe0] = 0;
++
++  if (pico_saturation) {
++    int k;
++    for (k = 0; k < 0xe0; k++)
++      Pico.est.HighPal[k] = pico_sat565(Pico.est.HighPal[k]);
++  }
+ }
+ 
+ static void FinalizeLineRGB555SMS(int line)
+diff --git a/platform/libretro/libretro.c b/platform/libretro/libretro.c
+index 7612396..64819d1 100644
+--- a/platform/libretro/libretro.c
++++ b/platform/libretro/libretro.c
+@@ -1822,6 +1822,8 @@ static enum input_device input_name_to_val(const char *name)
+    return PICO_INPUT_PAD_3BTN;
+ }
+ 
++extern int pico_saturation; /* pico/draw.c */
++
+ static void update_variables(bool first_run)
+ {
+    struct retro_variable var;
+@@ -1841,6 +1843,16 @@ static void update_variables(bool first_run)
+       has_4_pads = input == PICO_INPUT_PAD_TEAM || input == PICO_INPUT_PAD_4WAY;
+    }
+ 
++   var.value = NULL;
++   var.key = "picodrive_saturation";
++   {
++      int old_sat = pico_saturation;
++      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
++         pico_saturation = atoi(var.value);
++      if (pico_saturation != old_sat)
++         Pico.m.dirtyPal = 1;
++   }
++
+    var.value = NULL;
+    var.key = "picodrive_input2";
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)

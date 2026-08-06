@@ -20,3 +20,70 @@ index 3e18f65..23740be 100644
  else ifeq ($(platform), miyoo)
  	TARGET := $(TARGET_NAME)_libretro.so
  	CC = /opt/miyoo/usr/bin/arm-linux-gcc
+diff --git a/libretro/libretro.cpp b/libretro/libretro.cpp
+index 1d8c7f3..acd8347 100644
+--- a/libretro/libretro.cpp
++++ b/libretro/libretro.cpp
+@@ -919,11 +919,40 @@ static void update_audio_mode(void)
+ 	audio_first_init = false;
+ }
+ 
++// runtime saturation baked into the NES palette (0 = off). Applied when the
++// palette is rebuilt, so per-pixel blit cost is unchanged.
++static int nes_saturation = 0;
++static bool nes_sat_dirty = false;
++static uint16_t nes_sat565(uint16_t c)
++{
++   int f = 256 + nes_saturation * 40;
++   int r = ((c >> 11) & 0x1f) << 3, g = ((c >> 5) & 0x3f) << 2, b = (c & 0x1f) << 3;
++   int y = (r * 77 + g * 150 + b * 29) >> 8;
++   int nr = y + (((r - y) * f) >> 8);
++   int ng = y + (((g - y) * f) >> 8);
++   int nb = y + (((b - y) * f) >> 8);
++   if (nr < 0) nr = 0; else if (nr > 255) nr = 255;
++   if (ng < 0) ng = 0; else if (ng > 255) ng = 255;
++   if (nb < 0) nb = 0; else if (nb > 255) nb = 255;
++   return (uint16_t)(((nr >> 3) << 11) | ((ng >> 2) << 5) | (nb >> 3));
++}
++
+ static void check_variables(void)
+ {
+    struct retro_variable var = {0};
+    bool video_changed = false;
+ 
++   var.key = "quicknes_saturation";
++   var.value = NULL;
++   {
++      int old_sat = nes_saturation;
++      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
++         nes_saturation = atoi(var.value);
++      if (nes_saturation != old_sat)
++         nes_sat_dirty = true;
++   }
++   var = (struct retro_variable){0};
++
+    var.key = "quicknes_no_sprite_limit";
+ 
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+@@ -1355,9 +1384,11 @@ void retro_run(void)
+ 	   static int last_retro_palette_index = -1;
+ 	   static bool retro_palette_initialized = false;
+ 	   if ( !retro_palette_initialized
++	        || nes_sat_dirty
+ 	        || palette_index != last_retro_palette_index
+ 	        || memcmp(last_frame_palette, frame.palette, sizeof(last_frame_palette)) != 0 )
+ 	   {
++	      nes_sat_dirty = false;
+ 		   for (unsigned i = 0; i < 256; i++)
+ 		   {
+ 			   const Nes_Emu::rgb_t& rgb = current_nes_colors[frame.palette[i]];
+@@ -1367,6 +1398,9 @@ void retro_run(void)
+ 	         retro_palette[i] = ((rgb.red & 0xf8) << 8) | ((rgb.green & 0xfc) << 3) | ((rgb.blue & 0xf8) >> 3);
+ #endif
+ 		   }
++		   if (nes_saturation)
++			   for (unsigned i = 0; i < 256; i++)
++				   retro_palette[i] = nes_sat565(retro_palette[i]);
+ 		   memcpy(last_frame_palette, frame.palette, sizeof(last_frame_palette));
+ 		   last_retro_palette_index = palette_index;
+ 		   retro_palette_initialized = true;
