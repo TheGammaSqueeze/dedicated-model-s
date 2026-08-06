@@ -1379,14 +1379,6 @@ typedef struct {
 	int16_t left, right;
 } SND_Frame;
 
-// rolling 5s diagnostic counters, logged from frame_pacing_update
-static uint32_t diag_max_dt = 0;
-static int diag_pulses = 0;
-static int diag_free = 0;
-static int diag_stalls = 0;
-static int diag_ring_min = 0x7fffffff;
-static int diag_ring_max = 0;
-
 static struct SND_Context {
 	double frame_rate;
 	double resample_cursor;
@@ -1515,7 +1507,6 @@ size_t SND_produceCallback(const SND_Frame* frames, size_t count) {
 		SDL_LockAudio();
 		if (SDL_GetTicks() - wait_start > 250) {
 			SDL_UnlockAudio();
-			diag_stalls++;
 			LOG("SND_produceCallback timeout; dropping %u frames", (unsigned)count);
 			return 0;
 		}
@@ -4182,7 +4173,6 @@ static void App_render(void) {
 	// its purpose: present immediately so the skip actually buys catch-up
 	// time (no tearing either, the game layer was not touched).
 	int present_free = fastforward || frame_behind || !frame_rendered || audio_starved;
-	if (present_free) diag_free++;
 	present_layers(present_free ? VSYNC_NONE : VSYNC_WAIT);
 	present_free_p2 = present_free_p1;
 	present_free_p1 = present_free;
@@ -4287,27 +4277,6 @@ static void frame_pacing_update(void) {
 		int active = snd.frame_count > 0 && !fastforward;
 		unsigned occupancy = snd.frame_count > 1 ? (unsigned)(SND_availableToRead()*100 / (snd.frame_count-1)) : 0;
 		audio_status.callback(active, occupancy, active && pulse);
-	}
-
-	// rolling diagnostics: one compact line every 5s
-	if (dt > diag_max_dt) diag_max_dt = dt;
-	if (pulse) diag_pulses++;
-	int ring = SND_availableToRead();
-	if (ring < diag_ring_min) diag_ring_min = ring;
-	if (ring > diag_ring_max) diag_ring_max = ring;
-	static uint32_t diag_last = 0;
-	if (now - diag_last >= 5000) {
-		fprintf(stderr, "diag: maxdt %u pulses %d free %d stalls %d ring %d..%d/%d debt %0.1f panel %0.2f\n",
-			(unsigned)diag_max_dt, diag_pulses, diag_free, diag_stalls,
-			diag_ring_min, diag_ring_max, snd.frame_count, debt, panel_ms);
-		fflush(stderr);
-		diag_last = now;
-		diag_max_dt = 0;
-		diag_pulses = 0;
-		diag_free = 0;
-		diag_stalls = 0;
-		diag_ring_min = 0x7fffffff;
-		diag_ring_max = 0;
 	}
 }
 
