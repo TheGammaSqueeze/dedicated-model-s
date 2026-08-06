@@ -1,0 +1,22 @@
+diff --git a/Makefile b/Makefile
+index 3e18f65..23740be 100644
+--- a/Makefile
++++ b/Makefile
+@@ -363,6 +363,17 @@ else ifeq ($(platform), retrofw)
+ 	CXXFLAGS += -fno-rtti -fno-exceptions
+ 
+ # MIYOO
++else ifeq ($(platform), trimui)
++	TARGET := $(TARGET_NAME)_libretro.so
++	CC = $(CROSS_COMPILE)gcc
++	CXX = $(CROSS_COMPILE)g++
++	AR = $(CROSS_COMPILE)ar
++	fpic := -fPIC
++	SHARED := -shared -Wl,-version-script=link.T -Wl,-no-undefined
++	PLATFORM_DEFINES := -DNO_UNALIGNED_ACCESS
++	PLATFORM_DEFINES += -O3 -fomit-frame-pointer -march=armv5te -mtune=arm926ej-s -ffast-math
++	CXXFLAGS += -fno-rtti -fno-exceptions
++
+ else ifeq ($(platform), miyoo)
+ 	TARGET := $(TARGET_NAME)_libretro.so
+ 	CC = /opt/miyoo/usr/bin/arm-linux-gcc

@@ -4,15 +4,14 @@ endif
 
 #######################################
 
-CORES = gambatte gpsp pokemini picodrive fceumm
+CORES = gambatte gpsp pokemini picodrive quicknes
 
 gambatte_REPO = https://github.com/libretro/gambatte-libretro
 pokemini_REPO = https://github.com/libretro/PokeMini
 pokemini_MAKEFILE = Makefile.libretro
 picodrive_MAKEFILE = Makefile.libretro
 picodrive_FLAGS = use_libchdr=0 PLATFORM_TREMOR=1
-fceumm_REPO = https://github.com/libretro/libretro-fceumm
-fceumm_MAKEFILE = Makefile.libretro
+quicknes_REPO = https://github.com/libretro/QuickNES_Core
 
 #######################################
 

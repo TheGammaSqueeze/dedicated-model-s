@@ -2455,7 +2455,7 @@ static Console consoles[CONSOLE_COUNT] = {
 	[CONSOLE_GENESIS] = {"picodrive", "Genesis", "md", SHARPBIT_MD},
 	[CONSOLE_MASTER_SYSTEM] = {"picodrive", "Master System", "sms", SHARPBIT_MD},
 	[CONSOLE_GAME_GEAR] = {"picodrive", "Game Gear", "gg", SHARPBIT_GB},
-	[CONSOLE_NES] = {"fceumm", "Nintendo", "nes", SHARPBIT_NES},
+	[CONSOLE_NES] = {"quicknes", "Nintendo", "nes", SHARPBIT_NES},
 };
 static Console *Console_for(const char *path) {
 	const char *ext = strrchr(path, '.');
