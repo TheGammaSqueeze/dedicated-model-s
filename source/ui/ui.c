@@ -271,7 +271,7 @@ static struct {
 	uint32_t datetime;
 	uint32_t sharp;			// GB/GBC software sharp scaling (0 = stock hardware bilinear)
 	uint32_t sharp_gba;		// same for GBA, separate so GBA can stay on the hardware path
-	uint32_t unused[1];
+	uint32_t lcdfx;			// LCD overlay: 0 off, 1-3 scanlines, 4-6 grid (weak to strong)
 	char game[MAX_PATH];
 } settings = {
 	.version = 1,
@@ -2737,6 +2737,7 @@ typedef enum {
 	ITEM_ARCHIVE,
 	ITEM_RESET,
 	ITEM_CPU,
+	ITEM_LCD,
 } MenuItem;
 typedef enum {
 	PREVIEW_CURRENT,
@@ -2750,6 +2751,7 @@ static MenuItem current_items[] = {
 	ITEM_ARCHIVE,
 	ITEM_RESET,
 	ITEM_CPU,
+	ITEM_LCD,
 };
 static MenuItem other_items[] = {
 	ITEM_LOAD,
@@ -2775,6 +2777,12 @@ static const char *Menu_getItemName(MenuItem item) {
 		case ITEM_CPU: {
 			static char name[24];
 			sprintf(name, "CPU %uMHZ", cpu_speeds[cpu_speed_index].mhz);
+			return name;
+		}
+		case ITEM_LCD: {
+			static char name[16];
+			if (!settings.lcdfx) return "LCD OFF";
+			sprintf(name, "LCD %s %u", settings.lcdfx<=3 ? "SCAN" : "GRID", (settings.lcdfx-1)%3+1);
 			return name;
 		}
 	}
@@ -3728,7 +3736,11 @@ static void App_menu(void) {
 						CPU_setSpeed(cpu_speeds[cpu_speed_index].raw);
 						menu.dirty = 1;
 					}
-					if (item!=ITEM_ARCHIVE && item!=ITEM_CPU) Menu_quit();
+					else if (item==ITEM_LCD) {
+						settings.lcdfx = (settings.lcdfx + 1) % 7;
+						menu.dirty = 1;
+					}
+					if (item!=ITEM_ARCHIVE && item!=ITEM_CPU && item!=ITEM_LCD) Menu_quit();
 				}
 				else {
 					if (item==ITEM_LOAD) {
@@ -4116,6 +4128,28 @@ static int App_listen(void) {
 	
 	return ignore_menu;
 }
+// paint the LCD effect into the overlay: black lines at pixel alpha over a
+// transparent background, composited by the display backend in hardware.
+// This runs only when overlay content changes, never per frame.
+static void UI_lcdfx(SDL_Surface* dst) {
+	static const uint32_t alphas[3] = { 0x30, 0x50, 0x80 }; // weak, medium, strong
+	int style = (settings.lcdfx - 1) / 3;   // 0 scanlines, 1 grid
+	uint32_t c = alphas[(settings.lcdfx - 1) % 3] << 24;
+	uint32_t* px = (uint32_t*)dst->pixels;
+	int pitch = dst->pitch / 4;
+	for (int y=0; y<dst->h; y++) {
+		uint32_t* row = px + y*pitch;
+		if (style==0) { // scanlines: every other row
+			if (y & 1) for (int x=0; x<dst->w; x++) row[x] = c;
+			else memset(row, 0, dst->w*4);
+		}
+		else { // grid: 3px cells, 1px lines on both axes
+			if (y % 3 == 2) for (int x=0; x<dst->w; x++) row[x] = c;
+			else for (int x=0; x<dst->w; x++) row[x] = (x % 3 == 2) ? c : 0;
+		}
+	}
+}
+
 static void App_render(void) {
 	static int overlay_enabled = 0;
 	static int last_ff = -1;
@@ -4123,20 +4157,22 @@ static void App_render(void) {
 	static int last_bri = -1;
 	static int last_vol = -1;
 	static int last_skip = -1;
-	
+	static int last_lcdfx = -1;
+
 	if (invalidate_overlay) {
 		invalidate_overlay = 0;
 		overlay_enabled = 0;
 		last_ff = -1;
 	}
 
-	int show_overlay = fastforward || (has_frameskip && settings.frameskip) || ui.osd != OSD_NONE;
+	int show_overlay = fastforward || (has_frameskip && settings.frameskip) || ui.osd != OSD_NONE || settings.lcdfx;
 	int changed =
 		fastforward != last_ff ||
 		ui.osd != last_osd ||
 		settings.frameskip != last_skip ||
 		settings.brightness != last_bri ||
-		settings.volume != last_vol;
+		settings.volume != last_vol ||
+		settings.lcdfx != last_lcdfx;
 
 	if (changed) {
 		last_ff = fastforward;
@@ -4144,9 +4180,11 @@ static void App_render(void) {
 		last_bri = settings.brightness;
 		last_vol = settings.volume;
 		last_skip = settings.frameskip;
+		last_lcdfx = settings.lcdfx;
 
 		if (show_overlay) {
-			SDL_FillRect(overlay, NULL, 0);
+			if (settings.lcdfx) UI_lcdfx(overlay);
+			else SDL_FillRect(overlay, NULL, 0);
 
 			if (fastforward) {
 				UI_blit(ui.icons, &(SDL_Rect){24,0,12,12}, overlay, &(SDL_Rect){SCREEN_WIDTH-2-12,2,12,12});
