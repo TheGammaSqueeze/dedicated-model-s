@@ -2161,7 +2161,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	// the 565 scaler is pure 16-bit gathers with no color conversion, so it
 	// costs about the same as the stock convert blit; enabled per console
 	// via settings.sharp, keyed on g_sharp_bit set at core-select time
-	int sharp = display_mode==DISPMODE_FIT && g_sharp_bit>=0 &&
+	int sharp = (display_mode==DISPMODE_FIT || display_mode==DISPMODE_FIT_43) && g_sharp_bit>=0 &&
 		(settings.sharp & (1u << g_sharp_bit)) && width<=SCREEN_WIDTH && height<=SCREEN_HEIGHT;
 	static int last_sharp = -1;
 	static float last_window = 0;
@@ -2181,16 +2181,24 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 		last_window = sharp_window;
 
 		if (sharp) {
-			// aspect-fit size, rounded to even for the display engine; the
-			// height lands exactly on the screen dimension so reinit_layer's
-			// scale is 1.0 and the hardware passes the buffer through 1:1
-			float scale_x = (float)SCREEN_WIDTH / width;
-			float scale_y = (float)SCREEN_HEIGHT / height;
-			float fit = scale_x < scale_y ? scale_x : scale_y;
-			scaled_w = (int)(width * fit + 0.5f) & ~1;
-			scaled_h = (int)(height * fit + 0.5f) & ~1;
-			if (scaled_w > SCREEN_WIDTH) scaled_w = SCREEN_WIDTH;
-			if (scaled_h > SCREEN_HEIGHT) scaled_h = SCREEN_HEIGHT;
+			if (display_mode==DISPMODE_FIT_43) {
+				// software-scale straight to the full 4:3 panel and show it
+				// 1:1, so 4:3 stays crisp instead of hardware-stretching
+				scaled_w = SCREEN_WIDTH;
+				scaled_h = SCREEN_HEIGHT;
+			}
+			else {
+				// aspect-fit size, rounded to even for the display engine;
+				// the larger axis lands on the screen dimension so the
+				// output window is 1:1 and the hardware never resamples
+				float scale_x = (float)SCREEN_WIDTH / width;
+				float scale_y = (float)SCREEN_HEIGHT / height;
+				float fit = scale_x < scale_y ? scale_x : scale_y;
+				scaled_w = (int)(width * fit + 0.5f) & ~1;
+				scaled_h = (int)(height * fit + 0.5f) & ~1;
+				if (scaled_w > SCREEN_WIDTH) scaled_w = SCREEN_WIDTH;
+				if (scaled_h > SCREEN_HEIGHT) scaled_h = SCREEN_HEIGHT;
+			}
 
 			sharp_init_axis(sharp_sx, sharp_wx, width, scaled_w);
 			sharp_init_axis(sharp_sy, sharp_wy, height, scaled_h);
@@ -4061,7 +4069,7 @@ static void App_menu(void) {
 
 	// restore the layer to the on-screen frame size and mode (sharp GB/GBC
 	// renders 565 into a normal-mode layer, everything else scaler ARGB)
-	int game_bpp = (display_mode==DISPMODE_FIT && g_sharp_bit>=0 &&
+	int game_bpp = ((display_mode==DISPMODE_FIT || display_mode==DISPMODE_FIT_43) && g_sharp_bit>=0 &&
 		(settings.sharp & (1u << g_sharp_bit))) ? 16 : 32;
 	if (!app.quit && !app.reload && scaled_w && (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=game_bpp)) {
 		present_layers(VSYNC_WAIT);
