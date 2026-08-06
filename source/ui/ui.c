@@ -1368,11 +1368,24 @@ static inline int Pad_justRepeated(PadButton btn)	{ return pad.just_repeated & b
 #define RATE 48000
 #define SAMPLES 512
 #define CHANNELS 2
-#define BUFFER_DURATION 2 // in seconds
+// ring capacity in units of samples_per_frame, which rounds one video
+// frame of audio up to the next SAMPLES multiple (~1024). NOT seconds:
+// at 32768Hz the old value of 2 made a 62ms ring, far too small for any
+// cushion to exist in, and the produce side hit its timeout and dropped
+// audio whenever consumption hiccuped. 6 gives roughly 190ms.
+#define BUFFER_DURATION 6
 
 typedef struct {
 	int16_t left, right;
 } SND_Frame;
+
+// rolling 5s diagnostic counters, logged from frame_pacing_update
+static uint32_t diag_max_dt = 0;
+static int diag_pulses = 0;
+static int diag_free = 0;
+static int diag_stalls = 0;
+static int diag_ring_min = 0x7fffffff;
+static int diag_ring_max = 0;
 
 static struct SND_Context {
 	double frame_rate;
@@ -1502,6 +1515,7 @@ size_t SND_produceCallback(const SND_Frame* frames, size_t count) {
 		SDL_LockAudio();
 		if (SDL_GetTicks() - wait_start > 250) {
 			SDL_UnlockAudio();
+			diag_stalls++;
 			LOG("SND_produceCallback timeout; dropping %u frames", (unsigned)count);
 			return 0;
 		}
@@ -1530,16 +1544,31 @@ void SND_consumeCallback(void* userdata, uint8_t* stream, int len) {
 		return;
 	}
 
-	double ratio = snd.resample_ratio; // * snd.resample_drift;
-	double fill = (double)SND_availableToRead() / (double)snd.frame_count;
-	if (fill<0.5) ratio *= 0.99; // simple attempt to get ahead of underrun
-	
+	// dynamic rate control: bend the resample ratio in proportion to how
+	// far the ring is from the ~130ms cushion setpoint, so the buffer
+	// holds steady instead of drifting into the underrun floor or the
+	// refill ceiling. The 1.2% cap (about 20 cents) also has to absorb
+	// the standing production deficit of a panel that refreshes slower
+	// than the core's nominal rate, or the cushion drains on a cycle.
+	double ratio = snd.resample_ratio;
+	double target = (double)snd.frame_count * 0.7; // ring-relative setpoint
+	if (target > 0) {
+		double dev = ((double)SND_availableToRead() - target) / target;
+		if (dev > 1.0) dev = 1.0;
+		if (dev < -1.0) dev = -1.0;
+		ratio *= 1.0 + dev * 0.012;
+	}
+
+	static int16_t hold_l = 0, hold_r = 0;
 	for (int i=0; i<count; ++i) {
 		int available = SND_availableToRead();
 		if (available < 2) { // need 2 frames to resample
-			// LOG("consumer waiting (%i)...\n", available);
-			*out++ = 0;
-			*out++ = 0;
+			// hold the last sample instead of snapping to silence: an
+			// underrun then sounds like a soft smear, not a click
+			*out++ = hold_l;
+			*out++ = hold_r;
+			hold_l = (int16_t)(hold_l * 15 / 16);
+			hold_r = (int16_t)(hold_r * 15 / 16);
 			continue;
 		}
 
@@ -1555,6 +1584,8 @@ void SND_consumeCallback(void* userdata, uint8_t* stream, int len) {
 
 		*out++ = left;
 		*out++ = right;
+		hold_l = left;
+		hold_r = right;
 
 		snd.resample_cursor += ratio;
 
@@ -1913,6 +1944,8 @@ static struct retro_audio_buffer_status_callback audio_status = {0};
 static int frame_behind = 0;   // set by frame_pacing_update, read by App_render
 static int frame_rendered = 0; // did the core deliver video this iteration?
 static int audio_starved = 0;  // audio cushion below target, run vsync-free to refill
+static int present_free_p1 = 0; // last present skipped vsync
+static int present_free_p2 = 0; // and the one before it
 static bool environment_callback(unsigned cmd, void *data) {
 	switch (cmd) {
 		case RETRO_ENVIRONMENT_SET_MESSAGE: {
@@ -4148,7 +4181,11 @@ static void App_render(void) {
 	// vsync would make the skip cost a full period of wall time and defeat
 	// its purpose: present immediately so the skip actually buys catch-up
 	// time (no tearing either, the game layer was not touched).
-	present_layers((fastforward || frame_behind || !frame_rendered || audio_starved) ? VSYNC_NONE : VSYNC_WAIT);
+	int present_free = fastforward || frame_behind || !frame_rendered || audio_starved;
+	if (present_free) diag_free++;
+	present_layers(present_free ? VSYNC_NONE : VSYNC_WAIT);
+	present_free_p2 = present_free_p1;
+	present_free_p1 = present_free;
 }
 
 // frame pacing: measure real iteration time against the frame budget and
@@ -4169,9 +4206,38 @@ static void frame_pacing_update(void) {
 	prev_ms = now;
 
 	float budget = core.fps > 0 ? (float)(1000.0 / core.fps) : 16.7f;
-	if (dt == 0 || dt > 100) dt = (uint32_t)budget; // first frame, menus, load hitches
 
-	frame_behind = dt > budget + 2.0f;
+	// the panel does not necessarily refresh at the core's nominal rate.
+	// If it is slower, judging frames against the nominal budget marks
+	// every vsync-locked frame late, debt ratchets structurally and a
+	// skip fires about once a second into perfectly smooth scenes. Stock
+	// simply runs at panel rate; measure that rate from steady locked
+	// frames and honor it the same way.
+	static float panel_ms = 0;
+	if (!present_free_p1 && !present_free_p2 && dt >= 14 && dt <= 25) {
+		panel_ms = panel_ms > 0 ? panel_ms*0.95f + (float)dt*0.05f : (float)dt;
+	}
+	if (panel_ms > budget) budget = panel_ms;
+
+	// anything beyond ~2.5 refresh periods is not sustained load but a
+	// discrete stall (menus, autosave, SD hitches): that time is already
+	// lost, chasing it just fires skip bursts into an on-pace scene
+	if (dt == 0 || dt > 45) dt = (uint32_t)budget;
+
+	// a vsync-waited frame right after a vsync-free one pays phase
+	// realignment of up to a whole period: that is alignment, not load.
+	// Counting it re-arms the bypass and feeds the debt, a self-sustaining
+	// loop that fires skips into on-pace scenes.
+	if (!present_free_p1 && present_free_p2 && dt > budget) dt = (uint32_t)budget;
+
+	// bypass vsync only under confirmed pressure (two consecutive frames
+	// over budget, or debt already accumulated): periodic housekeeping
+	// makes single frames run long, and bypassing on a lone blip shows an
+	// unsynced present as a visible tear in an otherwise smooth scene
+	static int prev_over = 0;
+	int over = dt > budget + 3.0f;
+	frame_behind = over && (prev_over || debt >= budget);
+	prev_over = over;
 
 	// audio cushion with wide hysteresis: engage vsync-free refill only
 	// when the ring drops under ~3 frames of audio and keep refilling
@@ -4179,11 +4245,13 @@ static void frame_pacing_update(void) {
 	// here flaps between locked and free-running every few frames, and
 	// each re-lock waits out a partial refresh period, which both starves
 	// the ring at its floor and injects phantom slow frames.
-	int spf = (snd.frame_count > 0 && core.fps > 0) ? (int)(snd.sample_rate_in / core.fps) : 0;
-	if (spf > 0 && !fastforward) {
+	// thresholds are fractions of the ring's actual capacity: the floor
+	// at ~1/4 and the refill ceiling at ~5/8 (with a ~190ms ring that is
+	// ~48ms and ~117ms of audio)
+	if (snd.frame_count > 0 && !fastforward) {
 		int avail = SND_availableToRead();
-		if (audio_starved) audio_starved = avail < spf*10;
-		else               audio_starved = avail < spf*3;
+		if (audio_starved) audio_starved = avail < (snd.frame_count*5)/8;
+		else               audio_starved = avail < snd.frame_count/4;
 	}
 	else audio_starved = 0;
 
@@ -4219,6 +4287,27 @@ static void frame_pacing_update(void) {
 		int active = snd.frame_count > 0 && !fastforward;
 		unsigned occupancy = snd.frame_count > 1 ? (unsigned)(SND_availableToRead()*100 / (snd.frame_count-1)) : 0;
 		audio_status.callback(active, occupancy, active && pulse);
+	}
+
+	// rolling diagnostics: one compact line every 5s
+	if (dt > diag_max_dt) diag_max_dt = dt;
+	if (pulse) diag_pulses++;
+	int ring = SND_availableToRead();
+	if (ring < diag_ring_min) diag_ring_min = ring;
+	if (ring > diag_ring_max) diag_ring_max = ring;
+	static uint32_t diag_last = 0;
+	if (now - diag_last >= 5000) {
+		fprintf(stderr, "diag: maxdt %u pulses %d free %d stalls %d ring %d..%d/%d debt %0.1f panel %0.2f\n",
+			(unsigned)diag_max_dt, diag_pulses, diag_free, diag_stalls,
+			diag_ring_min, diag_ring_max, snd.frame_count, debt, panel_ms);
+		fflush(stderr);
+		diag_last = now;
+		diag_max_dt = 0;
+		diag_pulses = 0;
+		diag_free = 0;
+		diag_stalls = 0;
+		diag_ring_min = 0x7fffffff;
+		diag_ring_max = 0;
 	}
 }
 
