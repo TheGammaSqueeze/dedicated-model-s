@@ -270,7 +270,8 @@ static struct {
 	uint32_t frameskip;
 	uint32_t datetime;
 	uint32_t sharp;			// GB/GBC software sharp scaling (0 = stock hardware bilinear)
-	uint32_t unused[2];
+	uint32_t sharp_gba;		// same for GBA, separate so GBA can stay on the hardware path
+	uint32_t unused[1];
 	char game[MAX_PATH];
 } settings = {
 	.version = 1,
@@ -2030,16 +2031,15 @@ static bool environment_callback(unsigned cmd, void *data) {
 		default: return false;
 	}
 }
-// sharp-scale for GB/GBC only: the frame is scaled in software to the final
-// aspect-fit size (266x240) and the layer window is set equal to the buffer
-// so the hardware scaler never resamples (its bilinear filter blurred the
-// pixel art). The scale is nearest-neighbor except at source-pixel
-// boundaries, where a blend window ~half a destination pixel wide smooths
-// the uneven column widths and scroll shimmer that pure nearest-neighbor
-// shows at non-integer ratios. Interior pixels are untouched (weight 0 =
-// pure NN). Weights are per-axis constants for a given resolution so they
-// are precomputed once per layer size. GBA stays on the stock hardware
-// path, CPU scaling at 240x160 costs more than it can spare.
+// sharp-scale for GB/GBC (266x240) and GBA (320x212): the frame is scaled
+// in software to the final aspect-fit size and the layer window is set
+// equal to the buffer so the hardware scaler never resamples (its bilinear
+// filter blurred the pixel art). The scale is nearest-neighbor except at
+// source-pixel boundaries, where a blend window ~half a destination pixel
+// wide smooths the uneven column widths and scroll shimmer that pure
+// nearest-neighbor shows at non-integer ratios. Interior pixels are
+// untouched (weight 0 = pure NN). Weights are per-axis constants for a
+// given resolution so they are precomputed once per layer size.
 // transition = (1/sharp_window) dst pixels wide; adjustable in game with
 // MENU+A (+0.1, sharper) and MENU+Y (-0.1, softer), not persisted
 #define SHARP_WINDOW_DEFAULT	2.2f
@@ -2148,7 +2148,13 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 
 	// sharp scaling is opt-in (MENU+B in game); default is the stock
 	// hardware bilinear path
-	int sharp = display_mode==DISPMODE_FIT && settings.sharp && width==160 && height==144; // GB/GBC only
+	// GB/GBC and GBA: the 565 scaler is pure 16-bit gathers with no color
+	// conversion, so sharp GBA costs about the same as its stock convert
+	// blit (the old ARGB scaler that ruled GBA out no longer exists).
+	// The gather map holds byte indices, so source width must stay <256.
+	int sharp = display_mode==DISPMODE_FIT &&
+		((width==160 && height==144 && settings.sharp) ||
+		 (width==240 && height==160 && settings.sharp_gba));
 	static int last_sharp = -1;
 	static float last_window = 0;
 	static int last_mode = -1;
@@ -3990,7 +3996,9 @@ static void App_menu(void) {
 
 	// restore the layer to the on-screen frame size and mode (sharp GB/GBC
 	// renders 565 into a normal-mode layer, everything else scaler ARGB)
-	int game_bpp = (settings.sharp && display_mode==DISPMODE_FIT && framebuffer && framebuffer->w==160 && framebuffer->h==144) ? 16 : 32;
+	int game_bpp = (display_mode==DISPMODE_FIT && framebuffer &&
+		((framebuffer->w==160 && framebuffer->h==144 && settings.sharp) ||
+		 (framebuffer->w==240 && framebuffer->h==160 && settings.sharp_gba))) ? 16 : 32;
 	if (!app.quit && !app.reload && scaled_w && (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=game_bpp)) {
 		present_layers(VSYNC_WAIT);
 		reinit_layer(scaled_w, scaled_h, game_bpp);
@@ -4043,7 +4051,11 @@ static int App_listen(void) {
 			if (Pad_justPressed(PAD_B)) {
 				Pad_consume(PAD_B);
 				ignore_menu = 1;
-				settings.sharp = !settings.sharp;
+				// toggle the setting for the system currently running
+				if (framebuffer && framebuffer->w==240 && framebuffer->h==160)
+					settings.sharp_gba = !settings.sharp_gba;
+				else
+					settings.sharp = !settings.sharp;
 			}
 
 			if (Pad_justPressed(PAD_X)) {
@@ -4052,7 +4064,9 @@ static int App_listen(void) {
 				display_mode = (display_mode + 1) % DISPMODE_COUNT;
 			}
 
-			if (settings.sharp) {
+			int sharp_here = (framebuffer && framebuffer->w==240 && framebuffer->h==160)
+				? settings.sharp_gba : settings.sharp;
+			if (sharp_here) {
 				if (Pad_justRepeated(PAD_A)) {
 					Pad_consume(PAD_A);
 					ignore_menu = 1;
