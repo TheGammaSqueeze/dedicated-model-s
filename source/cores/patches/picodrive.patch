@@ -1,0 +1,22 @@
+diff --git a/Makefile.libretro b/Makefile.libretro
+index b6e583f..9fe5d10 100644
+--- a/Makefile.libretro
++++ b/Makefile.libretro
+@@ -497,6 +497,17 @@ endif
+ 	CFLAGS += -DMIPS_USE_SYNCI
+ 	
+ # MIYOO
++else ifeq ($(platform), trimui)
++	TARGET := $(TARGET_NAME)_libretro.so
++	CC = $(CROSS_COMPILE)gcc
++	AR = $(CROSS_COMPILE)ar
++	SHARED := -shared -nostdlib
++	fpic := -fPIC
++	LIBM :=
++	CFLAGS += -fomit-frame-pointer -ffast-math -march=armv5te -mtune=arm926ej-s -D__GCW0__ -O3
++	HAVE_ARMv6 = 0
++	LOW_MEMORY = 1
++
+ else ifeq ($(platform), miyoo)
+ 	TARGET := $(TARGET_NAME)_libretro.so
+ 	CC = /opt/miyoo/usr/bin/arm-linux-gcc

@@ -269,8 +269,8 @@ static struct {
 	uint32_t brightness;	// 0 - 10
 	uint32_t frameskip;
 	uint32_t datetime;
-	uint32_t sharp;			// GB/GBC software sharp scaling (0 = stock hardware bilinear)
-	uint32_t sharp_gba;		// same for GBA, separate so GBA can stay on the hardware path
+	uint32_t sharp;			// per-console sharp-scaling bitmask (0 = stock hardware bilinear); see SHARPBIT_*
+	uint32_t sharp_resv;	// reserved (was a second sharp flag); kept so settings.bin layout is unchanged
 	uint32_t lcdfx;			// LCD overlay: 0 off, 1-3 scanlines, 4-6 grid (weak to strong)
 	char game[MAX_PATH];
 } settings = {
@@ -2116,12 +2116,17 @@ static inline uint32_t argb_blend(uint32_t a, uint32_t b, uint32_t w) { // w 0..
 #define AVG565(a,b)  ((uint16_t)((((a)&(b)) + ((((a)^(b))>>1) & 0x7BEF))))
 #define AVG565P(a,b) (((a)&(b)) + ((((a)^(b))>>1) & 0x7BEF7BEF))
 
-static uint8_t  sharp_gather[SCREEN_WIDTH];
-static struct { uint16_t x; uint8_t s; uint8_t q; } sharp_hblend[SCREEN_WIDTH];
+// sharp bit for the game currently loaded (-1 = none); set at core-select
+// time so the scaler keys on the console, not the frame size (NES and
+// Genesis can both report 256x240)
+static int g_sharp_bit = -1;
+
+static uint16_t sharp_gather[SCREEN_WIDTH]; // 16-bit so it can index a 320-wide (Genesis) source
+static struct { uint16_t x; uint16_t s; uint8_t q; } sharp_hblend[SCREEN_WIDTH];
 static int sharp_hblend_n = 0;
 
 static void sharp_scale_row(uint16_t* dst, const uint16_t* src, int dst_len) {
-	const uint8_t* g = sharp_gather;
+	const uint16_t* g = sharp_gather;
 	for (int x=0; x<dst_len; x+=2) {
 		dst[x]   = src[g[x]];
 		dst[x+1] = src[g[x+1]];
@@ -2152,9 +2157,11 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	// conversion, so sharp GBA costs about the same as its stock convert
 	// blit (the old ARGB scaler that ruled GBA out no longer exists).
 	// The gather map holds byte indices, so source width must stay <256.
-	int sharp = display_mode==DISPMODE_FIT &&
-		((width==160 && height==144 && settings.sharp) ||
-		 (width==240 && height==160 && settings.sharp_gba));
+	// the 565 scaler is pure 16-bit gathers with no color conversion, so it
+	// costs about the same as the stock convert blit; enabled per console
+	// via settings.sharp, keyed on g_sharp_bit set at core-select time
+	int sharp = display_mode==DISPMODE_FIT && g_sharp_bit>=0 &&
+		(settings.sharp & (1u << g_sharp_bit)) && width<=SCREEN_WIDTH && height<=SCREEN_HEIGHT;
 	static int last_sharp = -1;
 	static float last_window = 0;
 	static int last_mode = -1;
@@ -2191,10 +2198,10 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 			// sparse blend list used by sharp_scale_row
 			sharp_hblend_n = 0;
 			for (int x=0; x<scaled_w; x++) {
-				sharp_gather[x] = (uint8_t)sharp_sx[x];
+				sharp_gather[x] = (uint16_t)sharp_sx[x];
 				if (sharp_wx[x]) {
 					sharp_hblend[sharp_hblend_n].x = (uint16_t)x;
-					sharp_hblend[sharp_hblend_n].s = (uint8_t)sharp_sx[x];
+					sharp_hblend[sharp_hblend_n].s = (uint16_t)sharp_sx[x];
 					sharp_hblend[sharp_hblend_n].q = (uint8_t)sharp_wx[x];
 					sharp_hblend_n++;
 				}
@@ -2418,28 +2425,54 @@ typedef enum {
 	CONSOLE_GAME_BOY_COLOR,
 	CONSOLE_GAME_BOY,
 	CONSOLE_POKEMON_MINI,
+	CONSOLE_GENESIS,
+	CONSOLE_MASTER_SYSTEM,
+	CONSOLE_GAME_GEAR,
+	CONSOLE_NES,
 	CONSOLE_COUNT,
 } ConsoleId;
+
+// which per-console sharp-scaling bit each console uses (see settings.sharp)
+enum {
+	SHARPBIT_GB  = 0, // Game Boy / Color / Game Gear (160x144 class)
+	SHARPBIT_GBA = 1,
+	SHARPBIT_MD  = 2, // Genesis / Master System
+	SHARPBIT_NES = 3,
+	SHARPBIT_NONE = -1,
+};
+
 typedef struct {
 	const char *core;
 	const char *name;
 	const char *slug;
+	int sharp_bit;
 } Console;
 static Console consoles[CONSOLE_COUNT] = {
-	[CONSOLE_GAME_BOY_ADVANCE] = {"gpsp","Game Boy Advance", "gba"},
-	[CONSOLE_GAME_BOY_COLOR] = {"gambatte", "Game Boy Color", "gbc"},
-	[CONSOLE_GAME_BOY] = {"gambatte", "Game Boy", "gb"},
-	[CONSOLE_POKEMON_MINI] = {"pokemini", "Pokemon Mini", "pkm"},
+	[CONSOLE_GAME_BOY_ADVANCE] = {"gpsp","Game Boy Advance", "gba", SHARPBIT_GBA},
+	[CONSOLE_GAME_BOY_COLOR] = {"gambatte", "Game Boy Color", "gbc", SHARPBIT_GB},
+	[CONSOLE_GAME_BOY] = {"gambatte", "Game Boy", "gb", SHARPBIT_GB},
+	[CONSOLE_POKEMON_MINI] = {"pokemini", "Pokemon Mini", "pkm", SHARPBIT_NONE},
+	[CONSOLE_GENESIS] = {"picodrive", "Genesis", "md", SHARPBIT_MD},
+	[CONSOLE_MASTER_SYSTEM] = {"picodrive", "Master System", "sms", SHARPBIT_MD},
+	[CONSOLE_GAME_GEAR] = {"picodrive", "Game Gear", "gg", SHARPBIT_GB},
+	[CONSOLE_NES] = {"fceumm", "Nintendo", "nes", SHARPBIT_NES},
 };
 static Console *Console_for(const char *path) {
 	const char *ext = strrchr(path, '.');
 	if (!ext) return NULL;
-	
+
 		 if (strcasecmp(ext, ".gba")==0) return &consoles[CONSOLE_GAME_BOY_ADVANCE];
 	else if (strcasecmp(ext, ".min")==0) return &consoles[CONSOLE_POKEMON_MINI];
 	else if (strcasecmp(ext, ".gbc")==0) return &consoles[CONSOLE_GAME_BOY_COLOR];
 	else if (strcasecmp(ext, ".gb")==0)	 return &consoles[CONSOLE_GAME_BOY];
 	else if (strcasecmp(ext, ".dmg")==0) return &consoles[CONSOLE_GAME_BOY];
+	else if (strcasecmp(ext, ".md")==0)	 return &consoles[CONSOLE_GENESIS];
+	else if (strcasecmp(ext, ".gen")==0) return &consoles[CONSOLE_GENESIS];
+	else if (strcasecmp(ext, ".smd")==0) return &consoles[CONSOLE_GENESIS];
+	else if (strcasecmp(ext, ".bin")==0) return &consoles[CONSOLE_GENESIS];
+	else if (strcasecmp(ext, ".sms")==0) return &consoles[CONSOLE_MASTER_SYSTEM];
+	else if (strcasecmp(ext, ".gg")==0)	 return &consoles[CONSOLE_GAME_GEAR];
+	else if (strcasecmp(ext, ".nes")==0) return &consoles[CONSOLE_NES];
 
 	return NULL;
 }
@@ -3184,7 +3217,8 @@ static void App_selectCore(void) {
 	
 	strcpy(core.name, console->core);
 	sprintf(core.path, "%s/%s_libretro.so", CORES_PATH, core.name);
-	
+	g_sharp_bit = console->sharp_bit;
+
 	LOG("core.path: %s", core.path);
 	LOG("core.name: %s", core.name);
 }
@@ -4008,9 +4042,8 @@ static void App_menu(void) {
 
 	// restore the layer to the on-screen frame size and mode (sharp GB/GBC
 	// renders 565 into a normal-mode layer, everything else scaler ARGB)
-	int game_bpp = (display_mode==DISPMODE_FIT && framebuffer &&
-		((framebuffer->w==160 && framebuffer->h==144 && settings.sharp) ||
-		 (framebuffer->w==240 && framebuffer->h==160 && settings.sharp_gba))) ? 16 : 32;
+	int game_bpp = (display_mode==DISPMODE_FIT && g_sharp_bit>=0 &&
+		(settings.sharp & (1u << g_sharp_bit))) ? 16 : 32;
 	if (!app.quit && !app.reload && scaled_w && (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=game_bpp)) {
 		present_layers(VSYNC_WAIT);
 		reinit_layer(scaled_w, scaled_h, game_bpp);
@@ -4064,10 +4097,7 @@ static int App_listen(void) {
 				Pad_consume(PAD_B);
 				ignore_menu = 1;
 				// toggle the setting for the system currently running
-				if (framebuffer && framebuffer->w==240 && framebuffer->h==160)
-					settings.sharp_gba = !settings.sharp_gba;
-				else
-					settings.sharp = !settings.sharp;
+				if (g_sharp_bit>=0) settings.sharp ^= (1u << g_sharp_bit);
 			}
 
 			if (Pad_justPressed(PAD_X)) {
@@ -4076,8 +4106,7 @@ static int App_listen(void) {
 				display_mode = (display_mode + 1) % DISPMODE_COUNT;
 			}
 
-			int sharp_here = (framebuffer && framebuffer->w==240 && framebuffer->h==160)
-				? settings.sharp_gba : settings.sharp;
+			int sharp_here = g_sharp_bit>=0 && (settings.sharp & (1u << g_sharp_bit));
 			if (sharp_here) {
 				if (Pad_justRepeated(PAD_A)) {
 					Pad_consume(PAD_A);
