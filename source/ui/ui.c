@@ -2050,7 +2050,8 @@ static float sharp_window = SHARP_WINDOW_DEFAULT;
 // MENU+X cycles the display mode (not persisted): aspect fit (default),
 // 1x integer centered, 2x integer (center-cropped when it overscans)
 enum {
-	DISPMODE_FIT = 0,
+	DISPMODE_FIT = 0, // aspect fit, square pixels (the native AR)
+	DISPMODE_FIT_43,  // stretched to fill the 4:3 panel (NES/MD/SMS only)
 	DISPMODE_1X,
 	DISPMODE_2X,
 
@@ -2224,10 +2225,28 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 	// the blit below is only valid when the layer matches the scaled frame
 	if (SCALER_WIDTH!=scaled_w || SCALER_HEIGHT!=scaled_h || SCALER_BPP!=(sharp?16:32)) reinit_layer(scaled_w, scaled_h, sharp?16:32);
 
-	// the integer modes must be shown 1:1; reinit_layer stretches to fit the
-	// screen, so pin the window back to the buffer size after any reinit
-	if (display_mode!=DISPMODE_FIT && (sc_info.screen_win.width!=(unsigned)scaled_w || sc_info.screen_win.height!=(unsigned)scaled_h)) {
-		resize_scaler((SCREEN_WIDTH-scaled_w)/2, (SCREEN_HEIGHT-scaled_h)/2, scaled_w, scaled_h);
+	// set the hardware output window for the current mode (checked every
+	// frame, but the ioctl only fires when it actually changes): aspect fit
+	// with square pixels, 4:3 fill, or 1:1 centered for the integer modes
+	{
+		int wx, wy, ww, wh;
+		if (display_mode==DISPMODE_FIT_43) {
+			wx = 0; wy = 0; ww = SCREEN_WIDTH; wh = SCREEN_HEIGHT;
+		}
+		else if (display_mode==DISPMODE_FIT) {
+			float sx = (float)SCREEN_WIDTH/scaled_w, sy = (float)SCREEN_HEIGHT/scaled_h;
+			float s = sx < sy ? sx : sy;
+			ww = ((int)(scaled_w*s+0.5f)) & ~1; wh = ((int)(scaled_h*s+0.5f)) & ~1;
+			wx = ((SCREEN_WIDTH-ww)/2) & ~1;    wy = ((SCREEN_HEIGHT-wh)/2) & ~1;
+		}
+		else { // 1X, 2X: 1:1 centered
+			ww = scaled_w; wh = scaled_h;
+			wx = (SCREEN_WIDTH-scaled_w)/2; wy = (SCREEN_HEIGHT-scaled_h)/2;
+		}
+		if (sc_info.screen_win.x!=wx || sc_info.screen_win.y!=wy ||
+			sc_info.screen_win.width!=(unsigned)ww || sc_info.screen_win.height!=(unsigned)wh) {
+			resize_scaler(wx, wy, ww, wh);
+		}
 	}
 
 	frame_rendered = 1;
@@ -4103,7 +4122,11 @@ static int App_listen(void) {
 			if (Pad_justPressed(PAD_X)) {
 				Pad_consume(PAD_X);
 				ignore_menu = 1;
-				display_mode = (display_mode + 1) % DISPMODE_COUNT;
+				// the 4:3 stretch only applies to NES/MD/SMS (bit >= MD);
+				// skip it in the cycle for every other system
+				do {
+					display_mode = (display_mode + 1) % DISPMODE_COUNT;
+				} while (display_mode==DISPMODE_FIT_43 && g_sharp_bit < SHARPBIT_MD);
 			}
 
 			int sharp_here = g_sharp_bit>=0 && (settings.sharp & (1u << g_sharp_bit));
